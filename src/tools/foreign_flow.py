@@ -1149,6 +1149,143 @@ def analyze_tape_reading(ticker: str, period: str = "5d") -> dict:
 
 
 
+# ── Multi-Timeframe Confluence ─────────────────────────────────────────────────
+
+_PHASE_SCORE = {
+    "ACCUMULATION": +2,
+    "MARKUP":       +1,
+    "TRANSITION":    0,
+    "DISTRIBUTION": -1,
+    "MARKDOWN":     -2,
+}
+
+_TF_WEIGHTS = {
+    "1mo": 1,
+    "3mo": 2,
+    "6mo": 3,
+}
+
+
+def analyze_bandarmology_mtf(ticker: str) -> dict:
+    """
+    Multi-timeframe bandarmology confluence.
+
+    Jalankan analisis untuk 3 timeframe (1mo, 3mo, 6mo) lalu gabungkan:
+    - Timeframe lebih panjang = bobot lebih besar
+    - Fase scoring: ACCUMULATION=+2, MARKUP=+1, TRANSITION=0,
+                    DISTRIBUTION=-1, MARKDOWN=-2
+    - Weighted score → overall bias + actionable signal
+
+    Contoh interpretasi:
+      6mo=ACCUMULATION, 3mo=MARKUP, 1mo=MARKUP  → sangat bullish (semua align)
+      6mo=MARKUP, 3mo=DISTRIBUTION, 1mo=MARKDOWN → topping, waspada
+      6mo=MARKDOWN, 3mo=TRANSITION, 1mo=ACCUMULATION → early reversal, wait confirm
+    """
+    timeframes = ["1mo", "3mo", "6mo"]
+    results = {}
+
+    for tf in timeframes:
+        r = analyze_bandarmology(ticker, tf)
+        if "error" in r:
+            results[tf] = {"error": r["error"]}
+        else:
+            results[tf] = {
+                "phase":          r["current_phase"]["phase"],
+                "confidence":     r["current_phase"]["confidence"],
+                "strength":       r["current_phase"]["strength"],
+                "bandar_strength": r["bandar_strength"]["score"],
+                "mf_score":       r["money_flow_indicators"]["composite"]["score"],
+                "divergence":     r["divergence"]["bias"],
+                "div_summary":    r["divergence"]["summary"],
+                "price_trend":    r["price_action"]["trend_pct"],
+                "volume_status":  r["volume_action"]["volume_status"],
+            }
+
+    # ── Weighted confluence score ──────────────────────────────────────────
+    total_weight = 0
+    weighted_sum = 0.0
+    phase_votes  = {}
+
+    for tf, data in results.items():
+        if "error" in data:
+            continue
+        w     = _TF_WEIGHTS[tf]
+        score = _PHASE_SCORE.get(data["phase"], 0)
+        weighted_sum += score * w
+        total_weight += w
+        phase_votes[tf] = data["phase"]
+
+    if total_weight == 0:
+        return {"ticker": ticker, "error": "Semua timeframe gagal diambil datanya"}
+
+    confluence_score = round(weighted_sum / total_weight, 2)  # -2 .. +2
+
+    # Normalize ke -100..+100
+    normalized = round(confluence_score / 2 * 100, 1)
+
+    # Overall bias
+    if confluence_score >= 1.5:
+        overall_bias   = "STRONG BULLISH"
+        bias_signal    = "🔥 Semua TF align bullish — momentum kuat, bisa entry"
+        action         = "BUY"
+    elif confluence_score >= 0.5:
+        overall_bias   = "BULLISH"
+        bias_signal    = "🟢 Mayoritas TF bullish — perhatikan TF pendek untuk timing"
+        action         = "BUY/WATCH"
+    elif confluence_score >= -0.4:
+        overall_bias   = "NEUTRAL"
+        bias_signal    = "🟡 TF tidak align — tunggu konfirmasi lebih lanjut"
+        action         = "WAIT"
+    elif confluence_score >= -1.4:
+        overall_bias   = "BEARISH"
+        bias_signal    = "🟠 Mayoritas TF bearish — hindari entry baru"
+        action         = "AVOID"
+    else:
+        overall_bias   = "STRONG BEARISH"
+        bias_signal    = "🔴 Semua TF align bearish — AVOID atau pertimbangkan exit"
+        action         = "AVOID/EXIT"
+
+    # Alignment check
+    unique_phases = set(phase_votes.values())
+    if len(unique_phases) == 1:
+        alignment = "PERFECT"
+        alignment_note = f"Semua TF sepakat: {list(unique_phases)[0]}"
+    elif len(unique_phases) == 2:
+        alignment = "GOOD"
+        alignment_note = f"2 dari 3 TF align"
+    else:
+        alignment = "MIXED"
+        alignment_note = "Setiap TF beda fase — sinyal konflik"
+
+    # Divergence across timeframes
+    div_flags = [data.get("divergence", "CONFIRMED") for data in results.values() if "error" not in data]
+    bullish_divs = sum(1 for d in div_flags if d == "BULLISH_DIV")
+    bearish_divs = sum(1 for d in div_flags if d == "BEARISH_DIV")
+
+    return {
+        "ticker": ticker,
+        "confluence": {
+            "score": normalized,
+            "raw_score": confluence_score,
+            "overall_bias": overall_bias,
+            "signal": bias_signal,
+            "action": action,
+            "alignment": alignment,
+            "alignment_note": alignment_note,
+        },
+        "divergence_across_tf": {
+            "bullish_div_count": bullish_divs,
+            "bearish_div_count": bearish_divs,
+            "note": (
+                "⚠️ Bearish divergence di beberapa TF — waspada" if bearish_divs >= 2
+                else "💡 Bullish divergence di beberapa TF — potensi reversal" if bullish_divs >= 2
+                else "Normal"
+            ),
+        },
+        "timeframes": results,
+    }
+
+
 # ==================== MCP TOOL WRAPPERS ====================
 
 def get_foreign_flow_tool() -> Tool:
@@ -1210,9 +1347,35 @@ async def get_bandarmology(arguments: dict) -> dict:
     """Handle bandarmology analysis request."""
     ticker = arguments.get("ticker")
     period = arguments.get("period", "3mo")
-    
+
     result = analyze_bandarmology(ticker, period)
     return result
+
+
+def get_bandarmology_mtf_tool() -> Tool:
+    return Tool(
+        name="get_bandarmology_mtf",
+        description=(
+            "Multi-timeframe bandarmology confluence — analisis 1mo + 3mo + 6mo sekaligus "
+            "untuk mendapat sinyal yang lebih kuat. Timeframe panjang diberi bobot lebih besar. "
+            "Berguna untuk: 'apakah BBCA layak masuk sekarang?', 'konfirmasi phase di semua TF', "
+            "'cari saham yang semua TF align bullish'"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Kode emiten IDX (contoh: BBCA, ZATA, TLKM)"
+                }
+            },
+            "required": ["ticker"]
+        }
+    )
+
+
+async def get_bandarmology_mtf(arguments: dict) -> dict:
+    return analyze_bandarmology_mtf(ticker=arguments.get("ticker", ""))
 
 
 def get_tape_reading_tool() -> Tool:

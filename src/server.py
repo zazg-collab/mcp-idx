@@ -26,6 +26,7 @@ from src.tools.watchlist import get_watchlist_prices_tool, get_watchlist_prices
 from src.tools.foreign_flow import (
     get_foreign_flow_tool, get_foreign_flow,
     get_bandarmology_tool, get_bandarmology,
+    get_bandarmology_mtf_tool, get_bandarmology_mtf,
     get_tape_reading_tool, get_tape_reading
 )
 from src.tools.fundamental import (
@@ -89,6 +90,7 @@ async def handle_list_tools() -> list[Tool]:
         get_watchlist_prices_tool(),
         get_foreign_flow_tool(),
         get_bandarmology_tool(),
+        get_bandarmology_mtf_tool(),
         get_tape_reading_tool(),
         get_financial_statements_tool(),
         get_earnings_growth_tool(),
@@ -132,6 +134,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             "get_watchlist_prices": get_watchlist_prices,
             "get_foreign_flow": get_foreign_flow,
             "get_bandarmology": get_bandarmology,
+            "get_bandarmology_mtf": get_bandarmology_mtf,
             "get_tape_reading": get_tape_reading,
             "get_financial_statements": get_financial_statements,
             "get_earnings_growth": get_earnings_growth,
