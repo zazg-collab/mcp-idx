@@ -14,6 +14,145 @@ from datetime import datetime, timedelta
 # Initialize API
 yahoo_api = YahooFinanceClient()
 
+_IHSG_TICKER = "^JKSE"
+
+
+def _calc_relative_vs_market(ticker_jk: str, period: str) -> dict:
+    """
+    Bandingkan pergerakan saham vs IHSG (^JKSE) untuk periode yang sama.
+
+    Menghasilkan:
+    - relative_strength : return saham / return IHSG (>1 outperform, <1 underperform)
+    - relative_volume   : vol_ratio saham / vol_ratio IHSG (>2 = saham jauh lebih aktif dari market)
+    - market_direction  : arah IHSG (UP / DOWN / SIDEWAYS)
+    - interpretation    : kombinasi RS + RV + market direction
+
+    Data source: yfinance (^JKSE untuk IHSG, ticker.JK untuk saham)
+    """
+    try:
+        stock_hist = yf.Ticker(ticker_jk).history(period=period)
+        ihsg_hist  = yf.Ticker(_IHSG_TICKER).history(period=period)
+
+        if stock_hist.empty or ihsg_hist.empty or len(stock_hist) < 10 or len(ihsg_hist) < 10:
+            return {"error": "Insufficient market data"}
+
+        # Align index ke tanggal yang ada di kedua series
+        common_idx = stock_hist.index.intersection(ihsg_hist.index)
+        if len(common_idx) < 10:
+            return {"error": "Not enough common trading days"}
+
+        s = stock_hist.loc[common_idx, "Close"]
+        m = ihsg_hist.loc[common_idx, "Close"]
+
+        # ── Return comparison ─────────────────────────────────────────────────
+        stock_return = float((s.iloc[-1] - s.iloc[0]) / s.iloc[0] * 100)
+        ihsg_return  = float((m.iloc[-1] - m.iloc[0]) / m.iloc[0] * 100)
+
+        # RS ratio: (1 + stock_return%) / (1 + ihsg_return%) - 1
+        # >0 = outperform, <0 = underperform, unit = excess return vs IHSG
+        rs = round((1 + stock_return / 100) / (1 + ihsg_return / 100) - 1, 4)
+        rs_pct = round(rs * 100, 2)  # dalam persen
+
+        # ── Volume comparison ─────────────────────────────────────────────────
+        sv = stock_hist.loc[common_idx, "Volume"]
+        mv = ihsg_hist.loc[common_idx, "Volume"]
+
+        sv_ma = sv.rolling(10, min_periods=5).mean()
+        mv_ma = mv.rolling(10, min_periods=5).mean()
+
+        stock_vol_ratio = float(sv.iloc[-5:].mean() / (sv_ma.iloc[-5:].mean() + 1))
+        ihsg_vol_ratio  = float(mv.iloc[-5:].mean() / (mv_ma.iloc[-5:].mean() + 1))
+        rel_vol = round(stock_vol_ratio / (ihsg_vol_ratio + 0.01), 2)
+
+        # ── Market direction ──────────────────────────────────────────────────
+        if ihsg_return > 1.5:
+            market_dir = "UP"
+        elif ihsg_return < -1.5:
+            market_dir = "DOWN"
+        else:
+            market_dir = "SIDEWAYS"
+
+        # ── Interpretation (berdasarkan rs_pct = excess return vs IHSG) ────────
+        if market_dir == "DOWN" and stock_return > 0:
+            interp = "🔥 VERY STRONG — Naik saat IHSG turun"
+            signal = "STRONG_BUY"
+        elif market_dir == "UP" and stock_return < 0:
+            interp = "🔴 VERY WEAK — Turun saat IHSG naik"
+            signal = "STRONG_SELL"
+        elif rs_pct > 10:
+            interp = f"🟢 OUTPERFORM +{rs_pct:.1f}% vs IHSG"
+            signal = "BULLISH"
+        elif rs_pct > 3:
+            interp = f"🟢 SLIGHT OUTPERFORM +{rs_pct:.1f}% vs IHSG"
+            signal = "BULLISH"
+        elif rs_pct < -10:
+            interp = f"🔴 UNDERPERFORM {rs_pct:.1f}% vs IHSG"
+            signal = "BEARISH"
+        elif rs_pct < -3:
+            interp = f"🟠 SLIGHT UNDERPERFORM {rs_pct:.1f}% vs IHSG"
+            signal = "BEARISH"
+        else:
+            interp = f"🟡 IN LINE ({rs_pct:+.1f}% vs IHSG)"
+            signal = "NEUTRAL"
+
+        # Relative volume context
+        if rel_vol > 3:
+            rv_note = f"Volume {rel_vol:.1f}x lebih aktif dari market — bandar spesifik saham ini"
+        elif rel_vol > 1.5:
+            rv_note = f"Volume {rel_vol:.1f}x vs market — sedikit lebih aktif"
+        elif rel_vol < 0.5:
+            rv_note = f"Volume {rel_vol:.1f}x vs market — saham sepi, market lebih ramai"
+        else:
+            rv_note = f"Volume {rel_vol:.1f}x vs market — setara kondisi market"
+
+        # ── IHSG peak-to-current context (rolling 2y) ─────────────────────────
+        ihsg_2y = yf.Ticker(_IHSG_TICKER).history(period="2y")
+        stock_2y = yf.Ticker(ticker_jk).history(period="2y")
+        ihsg_peak_ctx = {}
+        stock_peak_ctx = {}
+        if not ihsg_2y.empty:
+            ihsg_peak = float(ihsg_2y["Close"].max())
+            ihsg_curr = float(ihsg_2y["Close"].iloc[-1])
+            ihsg_peak_date = ihsg_2y["Close"].idxmax().date().isoformat()
+            ihsg_peak_ctx = {
+                "peak": round(ihsg_peak, 0),
+                "peak_date": ihsg_peak_date,
+                "current": round(ihsg_curr, 0),
+                "drawdown_from_peak_pct": round((ihsg_curr - ihsg_peak) / ihsg_peak * 100, 2),
+            }
+        if not stock_2y.empty:
+            s2_peak = float(stock_2y["Close"].max())
+            s2_curr = float(stock_2y["Close"].iloc[-1])
+            s2_peak_date = stock_2y["Close"].idxmax().date().isoformat()
+            stock_peak_ctx = {
+                "peak": round(s2_peak, 2),
+                "peak_date": s2_peak_date,
+                "current": round(s2_curr, 2),
+                "drawdown_from_peak_pct": round((s2_curr - s2_peak) / s2_peak * 100, 2),
+            }
+
+        return {
+            "market_ticker": "IHSG (^JKSE)",
+            "comparison_period": period,
+            "note": f"Return comparison untuk {period} terakhir. Lihat peak_context untuk gambaran dari puncak.",
+            "stock_return_pct": round(stock_return, 2),
+            "ihsg_return_pct": round(ihsg_return, 2),
+            "relative_strength_pct": rs_pct,
+            "rs_label": "OUTPERFORM" if rs_pct > 3 else "UNDERPERFORM" if rs_pct < -3 else "IN_LINE",
+            "stock_vol_ratio": round(stock_vol_ratio, 2),
+            "ihsg_vol_ratio": round(ihsg_vol_ratio, 2),
+            "relative_volume": rel_vol,
+            "rv_note": rv_note,
+            "market_direction": market_dir,
+            "interpretation": interp,
+            "signal": signal,
+            "ihsg_peak_context": ihsg_peak_ctx,
+            "stock_peak_context": stock_peak_ctx,
+        }
+
+    except Exception as e:
+        return {"error": f"Market comparison failed: {e}"}
+
 
 def analyze_foreign_flow(ticker: str, period: str = "1mo") -> dict:
     """
@@ -1109,6 +1248,10 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
         # ── Phase History ──────────────────────────────────────────────────────
         phase_history = _build_phase_history(hist)
 
+        # ── Relative vs Market ─────────────────────────────────────────────────
+        ticker_jk = ticker if ticker.endswith(".JK") else ticker + ".JK"
+        rel_market = _calc_relative_vs_market(ticker_jk, period)
+
         # ── Divergence Detection ───────────────────────────────────────────────
         divergence = _detect_divergence(hist, obv_series, cmf_series, mfi_series, window=10)
 
@@ -1154,6 +1297,7 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
             },
             "phase_history": phase_history,
             "divergence": divergence,
+            "relative_vs_market": rel_market,
             "money_flow_indicators": {
                 "composite": mf_signal,
                 "obv_trend_pct": round(obv_trend_pct, 2),
