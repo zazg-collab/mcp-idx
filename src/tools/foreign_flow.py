@@ -437,35 +437,121 @@ def detect_ara_arb_pattern(hist: pd.DataFrame, is_fca: bool = False) -> dict:
     }
 
 
+def _calc_obv(hist: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume — kumulatif volume diarahkan oleh close vs prev close."""
+    closes  = hist['Close'].values
+    volumes = hist['Volume'].values
+    obv = [0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i - 1]:
+            obv.append(obv[-1] + volumes[i])
+        elif closes[i] < closes[i - 1]:
+            obv.append(obv[-1] - volumes[i])
+        else:
+            obv.append(obv[-1])
+    return pd.Series(obv, index=hist.index)
+
+
+def _calc_cmf(hist: pd.DataFrame, window: int = 20) -> pd.Series:
+    """Chaikin Money Flow — pressure beli/jual -1 s/d +1."""
+    clv = ((hist['Close'] - hist['Low']) - (hist['High'] - hist['Close'])) / (
+        hist['High'] - hist['Low'] + 1e-9
+    )
+    mfv = clv * hist['Volume']
+    return mfv.rolling(window, min_periods=5).sum() / hist['Volume'].rolling(window, min_periods=5).sum()
+
+
+def _calc_mfi(hist: pd.DataFrame, window: int = 14) -> pd.Series:
+    """Money Flow Index — RSI berbasis volume-weighted (0-100)."""
+    tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
+    mf = tp * hist['Volume']
+    pos = mf.where(tp > tp.shift(1), 0)
+    neg = mf.where(tp < tp.shift(1), 0)
+    pos_sum = pos.rolling(window, min_periods=5).sum()
+    neg_sum = neg.rolling(window, min_periods=5).sum()
+    mfr = pos_sum / (neg_sum + 1e-9)
+    return 100 - (100 / (1 + mfr))
+
+
+def _calc_vwap(hist: pd.DataFrame) -> pd.Series:
+    """VWAP harian — rata-rata harga tertimbang volume (rolling 20 bar)."""
+    tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
+    cum_tpv = (tp * hist['Volume']).rolling(20, min_periods=5).sum()
+    cum_vol = hist['Volume'].rolling(20, min_periods=5).sum()
+    return cum_tpv / (cum_vol + 1e-9)
+
+
+def _money_flow_signal(cmf: float, mfi: float, obv_trend_pct: float, vwap_dev_pct: float) -> dict:
+    """
+    Composite money flow signal dari 4 indikator.
+    Score: -2 (strong sell) s/d +2 (strong buy) per indikator → total -8 s/d +8.
+    """
+    score = 0
+
+    # CMF: >0.05 = buying pressure, <-0.05 = selling pressure
+    if cmf > 0.15:   score += 2
+    elif cmf > 0.05: score += 1
+    elif cmf < -0.15: score -= 2
+    elif cmf < -0.05: score -= 1
+
+    # MFI: >60 = bullish, <40 = bearish, >80 = overbought, <20 = oversold
+    if mfi > 80:     score += 1   # Overbought (still bullish tapi hati2)
+    elif mfi > 60:   score += 2
+    elif mfi < 20:   score -= 1   # Oversold (masih bearish tapi potensial reversal)
+    elif mfi < 40:   score -= 2
+
+    # OBV trend: naik = akumulasi, turun = distribusi
+    if obv_trend_pct > 10:   score += 2
+    elif obv_trend_pct > 2:  score += 1
+    elif obv_trend_pct < -10: score -= 2
+    elif obv_trend_pct < -2:  score -= 1
+
+    # VWAP deviation: harga di atas VWAP = demand kuat
+    if vwap_dev_pct > 3:    score += 2
+    elif vwap_dev_pct > 1:  score += 1
+    elif vwap_dev_pct < -3: score -= 2
+    elif vwap_dev_pct < -1: score -= 1
+
+    # Normalize ke -100..+100
+    normalized = round((score / 8) * 100, 1)
+
+    if score >= 5:     label = "🔥 STRONG BUY — Uang masuk deras"
+    elif score >= 2:   label = "🟢 BUY — Tekanan beli dominan"
+    elif score >= -1:  label = "🟡 NEUTRAL — Flow seimbang"
+    elif score >= -4:  label = "🟠 SELL — Tekanan jual dominan"
+    else:              label = "🔴 STRONG SELL — Uang keluar deras"
+
+    return {"score": normalized, "label": label, "raw_score": score}
+
+
 def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
     """
     Analisis pola akumulasi/distribusi bandar berdasarkan price-volume action.
     OPTIMIZED FOR IDX MARKET.
-    
-    Konsep Bandarmology (IMPROVED FOR IDX):
-    - 3 Volume Regime: Low (<0.8x), Neutral (0.8-1.2x), High (>1.2x)
-    - Akumulasi: Bisa rapi (volume normal, volatilitas kecil, dominan up-close)
-    - Markup: Harga naik dengan volume tinggi (bandar pump), termasuk ARA pattern
-    - Distribusi: Harga turun pada volume tinggi saat harga masih di atas MA
-    - Markdown: Multiple patterns (classic, panic, grind down)
-    - NEUTRAL/TRANSISI: Jika tidak ada fase yang dominan jelas
-    - ARA/ARB Detection: Unique untuk pasar Indonesia
-    
+
+    Indikator:
+    - Phase detection: ACCUMULATION / MARKUP / DISTRIBUTION / MARKDOWN
+    - OBV  : On-Balance Volume (kumulatif arah volume)
+    - CMF  : Chaikin Money Flow (-1..+1, pressure beli/jual)
+    - MFI  : Money Flow Index (0-100, RSI berbasis volume)
+    - VWAP : harga vs rata-rata tertimbang volume (proximity signal)
+    - ARA/ARB detection: unique untuk pasar Indonesia
+
     Args:
         ticker: Stock ticker
         period: Analysis period
-        
+
     Returns:
-        Dictionary dengan analisis bandarmology
+        Dictionary dengan analisis bandarmology + money_flow_indicators
     """
     ticker = validate_ticker(ticker)
-    
+
     try:
         hist_data = yahoo_api.get_historical_data(ticker, period=period)
-        
+
         if 'error' in hist_data or 'data' not in hist_data:
             return {"error": "No historical data available"}
-        
+
         # Convert to DataFrame
         hist = pd.DataFrame(hist_data['data'])
         
@@ -680,17 +766,39 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
         else:
             confidence = "LOW"
         
+        # ── Money Flow Indicators ──────────────────────────────────────────────
+        obv_series  = _calc_obv(hist)
+        cmf_series  = _calc_cmf(hist)
+        mfi_series  = _calc_mfi(hist)
+        vwap_series = _calc_vwap(hist)
+
+        current_price = hist['Close'].iloc[-1]
+
+        # OBV trend: bandingkan rata-rata 5 bar terakhir vs 5 bar sebelumnya
+        obv_recent = obv_series.iloc[-5:].mean()
+        obv_prev   = obv_series.iloc[-10:-5].mean()
+        obv_trend_pct = ((obv_recent - obv_prev) / (abs(obv_prev) + 1)) * 100
+
+        cmf_now  = float(cmf_series.iloc[-1]) if not pd.isna(cmf_series.iloc[-1]) else 0.0
+        mfi_now  = float(mfi_series.iloc[-1]) if not pd.isna(mfi_series.iloc[-1]) else 50.0
+        vwap_now = float(vwap_series.iloc[-1]) if not pd.isna(vwap_series.iloc[-1]) else current_price
+        vwap_dev_pct = ((current_price - vwap_now) / (vwap_now + 1e-9)) * 100
+
+        mf_signal = _money_flow_signal(cmf_now, mfi_now, obv_trend_pct, vwap_dev_pct)
+
+        # ── ARA/ARB Detection ──────────────────────────────────────────────────
         # Detect ARA/ARB patterns (unique untuk IDX)
         ara_arb_analysis = detect_ara_arb_pattern(hist)
-        
-        # Get current ARA/ARB limits
-        current_price = hist['Close'].iloc[-1]
         current_limits = get_ara_arb_limit(current_price)
-        
+
         # Adjust bandar strength if ARA pattern detected
         if ara_arb_analysis['ara_hits'] >= 2:
-            bandar_strength = min(100, bandar_strength * 1.3)  # Boost 30% for ARA momentum
-        
+            bandar_strength = min(100, bandar_strength * 1.3)
+
+        # Blend money flow score into bandar_strength
+        mf_boost = mf_signal['raw_score'] * 1.5  # -12..+12 contribution
+        bandar_strength = max(0, min(100, bandar_strength + mf_boost))
+
         return {
             "ticker": ticker.replace('.JK', ''),
             "analysis_period": period,
@@ -707,10 +815,23 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
                 "distribution": scores['DISTRIBUTION'],
                 "markdown": scores['MARKDOWN']
             },
+            "money_flow_indicators": {
+                "composite": mf_signal,
+                "obv_trend_pct": round(obv_trend_pct, 2),
+                "obv_direction": "RISING" if obv_trend_pct > 2 else "FALLING" if obv_trend_pct < -2 else "FLAT",
+                "cmf": round(cmf_now, 4),
+                "cmf_signal": "BUY" if cmf_now > 0.05 else "SELL" if cmf_now < -0.05 else "NEUTRAL",
+                "mfi": round(mfi_now, 1),
+                "mfi_zone": "OVERBOUGHT" if mfi_now > 80 else "OVERSOLD" if mfi_now < 20 else "BULLISH" if mfi_now > 60 else "BEARISH" if mfi_now < 40 else "NEUTRAL",
+                "vwap": round(vwap_now, 2),
+                "vwap_deviation_pct": round(vwap_dev_pct, 2),
+                "vwap_position": "ABOVE" if vwap_dev_pct > 0 else "BELOW",
+                "note": "Proxy indicators — bukan real broker flow IDX"
+            },
             "price_action": {
                 "trend_pct": round(price_trend, 2),
                 "trend_direction": "UP" if price_trend > 5 else "DOWN" if price_trend < -5 else "SIDEWAYS",
-                "current_price": round(hist['Close'].iloc[-1], 2),
+                "current_price": round(current_price, 2),
                 "ma": round(hist['Price_MA'].iloc[-1], 2),
                 "ma_window": ma_window,
                 "ma_slope": round(ma_slope, 2),
