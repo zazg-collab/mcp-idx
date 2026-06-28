@@ -4,9 +4,14 @@ IDX Official Data Tools — via curl_cffi (browser impersonation).
 Mengambil data resmi dari IDX (idx.co.id) yang sebelumnya diblock Cloudflare.
 curl_cffi dengan impersonate='chrome' berhasil bypass proteksi tersebut.
 
+CATATAN PENTING:
+  GetFinancialReport IDX hanya menyimpan Annual Report (Laporan Tahunan),
+  BUKAN LK quarterly. TW1-TW4 di endpoint ini semua return file yang sama.
+  LK quarterly (Q1-Q3) ada di sistem e-Reporting XBRL IDX yang berbeda (503).
+
 Tools:
-  - get_financial_report  : Cek LK quarterly per emiten (TW1-TW4, per tahun)
-  - get_company_profile   : Profil lengkap emiten (direksi, komisaris, sekretaris)
+  - get_annual_report   : Cek Annual Report per emiten per tahun
+  - get_company_profile : Profil lengkap emiten (direksi, komisaris, sekretaris)
 """
 from __future__ import annotations
 
@@ -33,18 +38,13 @@ _HEADERS = {
 }
 
 _VALID_TICKER = re.compile(r"^[A-Z]{1,5}$")
-_PERIODE_MAP = {
-    "Q1": "TW1", "TW1": "TW1",
-    "Q2": "TW2", "TW2": "TW2",
-    "Q3": "TW3", "TW3": "TW3",
-    "Q4": "TW4", "TW4": "TW4",
-}
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def _clean_ticker(ticker: str) -> str:
-    t = ticker.strip().upper().replace(".JK", "")
-    return t
+    return ticker.strip().upper().replace(".JK", "")
+
 
 def _get(url: str) -> Optional[dict]:
     if not _CFFI_AVAILABLE:
@@ -58,18 +58,21 @@ def _get(url: str) -> Optional[dict]:
         return None
 
 
-# ── 1. Financial Report ────────────────────────────────────────────────────────
+def _fmt_date(raw: str) -> Optional[str]:
+    try:
+        return datetime.fromisoformat(raw).strftime("%Y-%m-%d")
+    except Exception:
+        return raw[:10] if raw else None
 
-def fetch_financial_report(
-    ticker: str,
-    year: Optional[int] = None,
-    quarter: Optional[str] = None,
-) -> dict:
+
+# ── 1. Annual Report ───────────────────────────────────────────────────────────
+
+def fetch_annual_report(ticker: str, year: Optional[int] = None) -> dict:
     """
-    Cek laporan keuangan (LK) emiten dari IDX official.
+    Cek Annual Report (Laporan Tahunan) emiten dari IDX official.
 
-    Bisa cek satu periode (year+quarter), semua quarter dalam satu tahun,
-    atau semua tahun yang tersedia (3 tahun terakhir).
+    CATATAN: Endpoint IDX GetFinancialReport hanya menyimpan Annual Report,
+    bukan LK quarterly. Untuk LK quarterly gunakan get_quarterly_earnings.
     """
     if not _CFFI_AVAILABLE:
         return {"error": "curl_cffi tidak terinstall. Jalankan: pip install curl_cffi"}
@@ -79,108 +82,69 @@ def fetch_financial_report(
         return {"error": f"Ticker tidak valid: {ticker}"}
 
     current_year = datetime.now().year
-
-    # Tentukan range tahun & periode yang akan dicek
-    if year and quarter:
-        # Spesifik: satu periode
-        periode = _PERIODE_MAP.get(quarter.upper())
-        if not periode:
-            return {"error": f"Quarter tidak valid: {quarter}. Gunakan Q1/Q2/Q3/Q4 atau TW1/TW2/TW3/TW4"}
-        years_to_check = [str(year)]
-        periodes_to_check = [periode]
-    elif year:
-        # Semua quarter tahun tersebut
-        years_to_check = [str(year)]
-        periodes_to_check = ["TW1", "TW2", "TW3", "TW4"]
-    else:
-        # 3 tahun terakhir, semua quarter
-        years_to_check = [str(current_year), str(current_year - 1), str(current_year - 2)]
-        periodes_to_check = ["TW1", "TW2", "TW3", "TW4"]
+    years_to_check = (
+        [str(year)] if year
+        else [str(current_year - i) for i in range(4)]
+    )
 
     results = []
     for yr in years_to_check:
-        for per in periodes_to_check:
-            url = (
-                f"{IDX_BASE}/GetFinancialReport"
-                f"?KodeEmiten={ticker}&ReportType=LK&Year={yr}&Periode={per}"
-            )
-            data = _get(url)
-            if not data:
-                continue
+        # TW4 sebagai proxy Annual Report (semua TW return file yang sama)
+        url = (
+            f"{IDX_BASE}/GetFinancialReport"
+            f"?KodeEmiten={ticker}&ReportType=LK&Year={yr}&Periode=TW4"
+        )
+        data = _get(url)
+        count = data.get("ResultCount", 0) if data else 0
 
-            count = data.get("ResultCount", 0)
-            quarter_label = per.replace("TW", "Q")
-
-            if count == 0:
-                results.append({
-                    "year": yr,
-                    "quarter": quarter_label,
-                    "status": "NOT PUBLISHED",
-                    "published_date": None,
-                    "files": [],
-                })
-                continue
-
-            row = data["Results"][0]
-            published = row.get("File_Modified", "")
-            # Format tanggal
-            try:
-                pub_dt = datetime.fromisoformat(published)
-                published_str = pub_dt.strftime("%Y-%m-%d")
-            except Exception:
-                published_str = published[:10] if published else None
-
-            attachments = row.get("Attachments", [])
-            files = []
-            for att in attachments:
-                fname = att.get("File_Name", "")
-                fpath = att.get("File_Path", "")
-                ftype = att.get("File_Type", "")
-                # Hanya ambil file LK (bukan Annual Report / ESG)
-                is_lk = any(k in fname.upper() for k in ["LK", "FINSTAT", "FINANCIAL", "LAPORAN"])
-                is_ar = any(k in fname.upper() for k in ["ANNUAL", "ESG", "TAHUNAN"])
-                files.append({
-                    "filename": fname,
-                    "url": IDX_PDF_BASE + fpath if fpath else None,
-                    "type": ftype,
-                    "category": "Annual Report" if is_ar else ("LK" if is_lk else "Other"),
-                })
-
-            # Cari LK file
-            lk_files = [f for f in files if f["category"] == "LK"]
-            other_files = [f for f in files if f["category"] != "LK"]
-
+        if count == 0:
             results.append({
                 "year": yr,
-                "quarter": quarter_label,
-                "status": "PUBLISHED",
-                "published_date": published_str,
-                "emiten": row.get("NamaEmiten", ticker),
-                "lk_files": lk_files,
-                "other_files": other_files,
+                "status": "NOT PUBLISHED",
+                "published_date": None,
+                "files": [],
+            })
+            continue
+
+        row = data["Results"][0]
+        attachments = row.get("Attachments", [])
+
+        files = []
+        for att in attachments:
+            fname = att.get("File_Name", "")
+            fpath = att.get("File_Path", "")
+            fname_up = fname.upper()
+            if any(k in fname_up for k in ["ESG", "SUSTAIN"]):
+                category = "ESG"
+            elif any(k in fname_up for k in ["ANNUAL", "TAHUNAN"]):
+                category = "Annual Report"
+            else:
+                category = "Other"
+            files.append({
+                "filename": fname,
+                "url": IDX_PDF_BASE + fpath if fpath else None,
+                "category": category,
             })
 
-    if not results:
-        return {
-            "ticker": ticker,
-            "error": "Tidak ada data. Pastikan kode emiten benar.",
-        }
+        results.append({
+            "year": yr,
+            "status": "PUBLISHED",
+            "published_date": _fmt_date(row.get("File_Modified", "")),
+            "emiten": row.get("NamaEmiten", ticker),
+            "files": files,
+        })
 
-    # Summary
     published = [r for r in results if r["status"] == "PUBLISHED"]
-    not_published = [r for r in results if r["status"] == "NOT PUBLISHED"]
-    latest = published[-1] if published else None
+    latest = published[0] if published else None
 
     return {
         "ticker": ticker,
-        "query": {
-            "years": years_to_check,
-            "quarters": [p.replace("TW", "Q") for p in periodes_to_check],
-        },
+        "report_type": "Annual Report (Laporan Tahunan)",
+        "note": "Untuk LK quarterly (Q1-Q3) gunakan get_quarterly_earnings atau cek Stockbit/platform broker.",
         "summary": {
+            "years_checked": years_to_check,
             "total_published": len(published),
-            "total_not_published": len(not_published),
-            "latest_published": f"{latest['year']} {latest['quarter']}" if latest else None,
+            "latest_year": latest["year"] if latest else None,
             "latest_published_date": latest["published_date"] if latest else None,
         },
         "reports": results,
@@ -213,55 +177,40 @@ def fetch_company_profile(ticker: str) -> dict:
 
     p = profiles[0]
 
-    # Listing date
-    listing_date = p.get("TanggalPencatatan", "")
-    try:
-        listing_dt = datetime.fromisoformat(listing_date)
-        listing_str = listing_dt.strftime("%Y-%m-%d")
-    except Exception:
-        listing_str = listing_date[:10] if listing_date else None
-
-    # Efek yang dicatatkan
     efek = []
-    if p.get("EfekEmiten_Saham"):
-        efek.append("Saham")
-    if p.get("EfekEmiten_Obligasi"):
-        efek.append("Obligasi")
-    if p.get("EfekEmiten_ETF"):
-        efek.append("ETF")
-    if p.get("EfekEmiten_EBA"):
-        efek.append("EBA")
+    if p.get("EfekEmiten_Saham"):    efek.append("Saham")
+    if p.get("EfekEmiten_Obligasi"): efek.append("Obligasi")
+    if p.get("EfekEmiten_ETF"):      efek.append("ETF")
+    if p.get("EfekEmiten_EBA"):      efek.append("EBA")
 
-    # Logo URL
     logo = p.get("Logo", "")
-    logo_url = IDX_PDF_BASE + logo if logo else None
 
-    # Direksi
-    direktur = []
-    for d in data.get("Direktur", []):
-        direktur.append({
-            "nama": d.get("Nama", ""),
+    direktur = [
+        {
+            "nama": d.get("Nama", "").strip(),
             "jabatan": d.get("Jabatan", ""),
             "afiliasi": d.get("Afiliasi", False),
-        })
+        }
+        for d in data.get("Direktur", [])
+    ]
 
-    # Komisaris
-    komisaris = []
-    for k in data.get("Komisaris", []):
-        komisaris.append({
-            "nama": k.get("Nama", ""),
+    komisaris = [
+        {
+            "nama": k.get("Nama", "").strip(),
             "jabatan": k.get("Jabatan", ""),
             "independen": k.get("Independen", False),
-        })
+        }
+        for k in data.get("Komisaris", [])
+    ]
 
-    # Sekretaris
-    sekretaris = []
-    for s in data.get("Sekretaris", []):
-        sekretaris.append({
-            "nama": s.get("Nama", ""),
+    sekretaris = [
+        {
+            "nama": s.get("Nama", "").strip(),
             "email": s.get("Email", ""),
             "telepon": s.get("Telepon", ""),
-        })
+        }
+        for s in data.get("Sekretaris", [])
+    ]
 
     return {
         "ticker": ticker,
@@ -272,15 +221,16 @@ def fetch_company_profile(ticker: str) -> dict:
         "industri": p.get("Industri", ""),
         "sub_industri": p.get("SubIndustri", ""),
         "papan_pencatatan": p.get("PapanPencatatan", ""),
-        "tanggal_listing": listing_str,
+        "tanggal_listing": _fmt_date(p.get("TanggalPencatatan", "")),
         "efek_tercatat": efek,
-        "alamat": (p.get("Alamat") or "").replace("\r\n", ", "),
+        "alamat": (p.get("Alamat") or "").replace("\r\n", ", ").strip(),
         "telepon": p.get("Telepon", ""),
         "email": p.get("Email", ""),
         "website": p.get("Website", ""),
-        "logo_url": logo_url,
+        "logo_url": IDX_PDF_BASE + logo if logo else None,
         "direksi": direktur,
         "komisaris": komisaris,
+        "komisaris_independen": [k for k in komisaris if k["independen"]],
         "sekretaris_perusahaan": sekretaris,
         "source": "IDX Official (idx.co.id)",
     }
@@ -292,12 +242,12 @@ def get_financial_report_tool() -> Tool:
     return Tool(
         name="get_financial_report",
         description=(
-            "Cek laporan keuangan (LK) emiten dari IDX official. "
-            "Bisa cek apakah LK sudah dipublikasi untuk periode tertentu (Q1/Q2/Q3/Q4), "
-            "beserta tanggal publikasi dan link PDF-nya. "
-            "Kalau tidak ada year/quarter, tampilkan 3 tahun terakhir semua quarter. "
-            "Gunakan untuk jawab: 'LK Q4 2025 BBCA sudah keluar?', "
-            "'ZATA sudah lapor Q1 2025 belum?', 'download LK terbaru TLKM'"
+            "Cek Annual Report (Laporan Tahunan) emiten dari IDX official. "
+            "Tampilkan status publish, tanggal rilis, dan link PDF Annual Report per tahun. "
+            "BUKAN untuk LK quarterly — endpoint IDX ini hanya menyimpan Laporan Tahunan. "
+            "Untuk LK quarterly gunakan get_quarterly_earnings. "
+            "Gunakan untuk: 'Annual Report ZATA 2025 sudah rilis?', "
+            "'kapan BBCA publish laporan tahunan 2024?', 'download AR TLKM'"
         ),
         inputSchema={
             "type": "object",
@@ -308,11 +258,7 @@ def get_financial_report_tool() -> Tool:
                 },
                 "year": {
                     "type": "integer",
-                    "description": "Tahun laporan (contoh: 2025). Opsional."
-                },
-                "quarter": {
-                    "type": "string",
-                    "description": "Quarter: Q1/Q2/Q3/Q4 atau TW1/TW2/TW3/TW4. Opsional."
+                    "description": "Tahun laporan (contoh: 2025). Opsional — kalau kosong cek 4 tahun terakhir."
                 }
             },
             "required": ["ticker"]
@@ -321,10 +267,9 @@ def get_financial_report_tool() -> Tool:
 
 
 async def get_financial_report(arguments: dict) -> dict:
-    return fetch_financial_report(
+    return fetch_annual_report(
         ticker=arguments.get("ticker", ""),
         year=arguments.get("year"),
-        quarter=arguments.get("quarter"),
     )
 
 
@@ -333,12 +278,12 @@ def get_company_profile_tool() -> Tool:
         name="get_company_profile",
         description=(
             "Profil lengkap emiten dari IDX official: nama perusahaan, sektor/industri, "
-            "kegiatan usaha, tanggal listing, papan pencatatan, alamat, kontak, "
-            "daftar direksi & jabatan, komisaris (termasuk independen), "
+            "kegiatan usaha, tanggal listing, papan pencatatan (Utama/Pengembangan/Akselerasi), "
+            "alamat, kontak, daftar direksi & jabatan, komisaris (termasuk independen), "
             "dan sekretaris perusahaan. "
             "Data lebih lengkap dari yfinance karena langsung dari IDX. "
             "Gunakan untuk: 'siapa direktur BBCA?', 'ZATA listing kapan?', "
-            "'komisaris independen TLKM siapa?'"
+            "'komisaris independen TLKM siapa?', 'papan pencatatan BBRI apa?'"
         ),
         inputSchema={
             "type": "object",
