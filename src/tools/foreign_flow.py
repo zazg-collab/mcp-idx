@@ -481,6 +481,142 @@ def _calc_vwap(hist: pd.DataFrame) -> pd.Series:
     return cum_tpv / (cum_vol + 1e-9)
 
 
+def _detect_divergence(
+    hist: pd.DataFrame,
+    obv_series: pd.Series,
+    cmf_series: pd.Series,
+    mfi_series: pd.Series,
+    window: int = 10,
+) -> dict:
+    """
+    Deteksi divergence antara price dan money flow indicators.
+
+    Bullish divergence  : price ↓ tapi indikator ↑ → akumulasi tersembunyi
+    Bearish divergence  : price ↑ tapi indikator ↓ → distribusi tersembunyi
+    Hidden bull div     : price ↑ (higher low) tapi indikator ↓ → trend lanjut naik
+    Hidden bear div     : price ↓ (lower high) tapi indikator ↑ → trend lanjut turun
+
+    Metode: bandingkan rata-rata separuh pertama vs separuh kedua dari window bars.
+    """
+    n = min(window * 2, len(hist))
+    if n < 10:
+        return {"detected": False, "signals": [], "summary": "Insufficient data"}
+
+    chunk = hist.tail(n)
+    half  = n // 2
+
+    # Price direction
+    price_early  = chunk['Close'].iloc[:half].mean()
+    price_recent = chunk['Close'].iloc[half:].mean()
+    price_up = price_recent > price_early * 1.005   # >0.5% threshold
+    price_down = price_recent < price_early * 0.995
+
+    # OBV direction
+    obv_chunk  = obv_series.iloc[-n:]
+    obv_early  = obv_chunk.iloc[:half].mean()
+    obv_recent = obv_chunk.iloc[half:].mean()
+    obv_up   = obv_recent > obv_early * 1.02
+    obv_down = obv_recent < obv_early * 0.98
+
+    # CMF direction (mean of period)
+    cmf_chunk  = cmf_series.iloc[-n:].dropna()
+    if len(cmf_chunk) >= 4:
+        cmf_early  = cmf_chunk.iloc[:len(cmf_chunk)//2].mean()
+        cmf_recent = cmf_chunk.iloc[len(cmf_chunk)//2:].mean()
+        cmf_up   = cmf_recent > cmf_early + 0.03
+        cmf_down = cmf_recent < cmf_early - 0.03
+    else:
+        cmf_up = cmf_down = False
+
+    # MFI direction
+    mfi_chunk  = mfi_series.iloc[-n:].dropna()
+    if len(mfi_chunk) >= 4:
+        mfi_early  = mfi_chunk.iloc[:len(mfi_chunk)//2].mean()
+        mfi_recent = mfi_chunk.iloc[len(mfi_chunk)//2:].mean()
+        mfi_up   = mfi_recent > mfi_early + 3
+        mfi_down = mfi_recent < mfi_early - 3
+    else:
+        mfi_up = mfi_down = False
+
+    signals = []
+
+    # ── Bearish divergence: price ↑ tapi indikator ↓ ────────────────────────
+    if price_up:
+        if obv_down:
+            signals.append({
+                "type": "BEARISH",
+                "indicator": "OBV",
+                "detail": "Harga naik tapi OBV turun — volume tidak konfirmasi rally",
+                "severity": "HIGH",
+            })
+        if cmf_down:
+            signals.append({
+                "type": "BEARISH",
+                "indicator": "CMF",
+                "detail": "Harga naik tapi CMF turun — tekanan beli melemah",
+                "severity": "MODERATE",
+            })
+        if mfi_down:
+            signals.append({
+                "type": "BEARISH",
+                "indicator": "MFI",
+                "detail": "Harga naik tapi MFI turun — money flow melemah",
+                "severity": "MODERATE",
+            })
+
+    # ── Bullish divergence: price ↓ tapi indikator ↑ ────────────────────────
+    if price_down:
+        if obv_up:
+            signals.append({
+                "type": "BULLISH",
+                "indicator": "OBV",
+                "detail": "Harga turun tapi OBV naik — ada akumulasi tersembunyi",
+                "severity": "HIGH",
+            })
+        if cmf_up:
+            signals.append({
+                "type": "BULLISH",
+                "indicator": "CMF",
+                "detail": "Harga turun tapi CMF naik — tekanan beli diam-diam meningkat",
+                "severity": "MODERATE",
+            })
+        if mfi_up:
+            signals.append({
+                "type": "BULLISH",
+                "indicator": "MFI",
+                "detail": "Harga turun tapi MFI naik — smart money mulai masuk",
+                "severity": "MODERATE",
+            })
+
+    bullish_count = sum(1 for s in signals if s["type"] == "BULLISH")
+    bearish_count = sum(1 for s in signals if s["type"] == "BEARISH")
+    high_count    = sum(1 for s in signals if s["severity"] == "HIGH")
+
+    if not signals:
+        summary = "✅ No divergence — price dan indikator konfirmasi satu sama lain"
+        bias = "CONFIRMED"
+    elif bullish_count > bearish_count:
+        summary = f"🟢 BULLISH DIVERGENCE ({bullish_count} signal) — potensi reversal naik atau akumulasi"
+        bias = "BULLISH_DIV"
+    elif bearish_count > bullish_count:
+        summary = f"🔴 BEARISH DIVERGENCE ({bearish_count} signal) — waspadai distribusi atau reversal turun"
+        bias = "BEARISH_DIV"
+    else:
+        summary = "🟡 MIXED signals — konflik antara indikator"
+        bias = "MIXED"
+
+    return {
+        "detected": len(signals) > 0,
+        "bias": bias,
+        "bullish_count": bullish_count,
+        "bearish_count": bearish_count,
+        "high_severity_count": high_count,
+        "signals": signals,
+        "summary": summary,
+        "window_bars": n,
+    }
+
+
 def _money_flow_signal(cmf: float, mfi: float, obv_trend_pct: float, vwap_dev_pct: float) -> dict:
     """
     Composite money flow signal dari 4 indikator.
@@ -786,6 +922,20 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
 
         mf_signal = _money_flow_signal(cmf_now, mfi_now, obv_trend_pct, vwap_dev_pct)
 
+        # ── Divergence Detection ───────────────────────────────────────────────
+        divergence = _detect_divergence(hist, obv_series, cmf_series, mfi_series, window=10)
+
+        # Divergence dapat override phase confidence
+        # Bearish div saat MARKUP/ACCUMULATION → turunkan bandar_strength
+        # Bullish div saat MARKDOWN/DISTRIBUTION → naikkan sedikit
+        div_adjustment = 0
+        if divergence["detected"]:
+            high_sev = divergence["high_severity_count"]
+            if divergence["bias"] == "BEARISH_DIV" and current_phase in ("MARKUP", "ACCUMULATION"):
+                div_adjustment = -(high_sev * 8)
+            elif divergence["bias"] == "BULLISH_DIV" and current_phase in ("MARKDOWN", "DISTRIBUTION"):
+                div_adjustment = +(high_sev * 6)
+
         # ── ARA/ARB Detection ──────────────────────────────────────────────────
         # Detect ARA/ARB patterns (unique untuk IDX)
         ara_arb_analysis = detect_ara_arb_pattern(hist)
@@ -795,9 +945,9 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
         if ara_arb_analysis['ara_hits'] >= 2:
             bandar_strength = min(100, bandar_strength * 1.3)
 
-        # Blend money flow score into bandar_strength
+        # Blend money flow score + divergence adjustment into bandar_strength
         mf_boost = mf_signal['raw_score'] * 1.5  # -12..+12 contribution
-        bandar_strength = max(0, min(100, bandar_strength + mf_boost))
+        bandar_strength = max(0, min(100, bandar_strength + mf_boost + div_adjustment))
 
         return {
             "ticker": ticker.replace('.JK', ''),
@@ -815,6 +965,7 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
                 "distribution": scores['DISTRIBUTION'],
                 "markdown": scores['MARKDOWN']
             },
+            "divergence": divergence,
             "money_flow_indicators": {
                 "composite": mf_signal,
                 "obv_trend_pct": round(obv_trend_pct, 2),
