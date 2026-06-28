@@ -34,6 +34,15 @@ from src.tools.fundamental import (
     get_analyst_ratings_tool, get_analyst_ratings,
     get_dividend_history_tool, get_dividend_history
 )
+from src.tools.fundamental_extended import (
+    get_quarterly_earnings_tool, get_quarterly_earnings,
+    get_ownership_tool, get_ownership_info,
+    get_corporate_actions_tool, get_corporate_actions,
+)
+from src.tools.idx_official import (
+    get_financial_report_tool, get_financial_report,
+    get_company_profile_tool, get_company_profile,
+)
 from src.tools.breakout import get_breakout_detection_tool, get_breakout_detection
 from src.tools.divergence import get_divergence_detection_tool, get_divergence_detection
 from src.tools.intraday import (
@@ -85,6 +94,13 @@ async def handle_list_tools() -> list[Tool]:
         get_earnings_growth_tool(),
         get_analyst_ratings_tool(),
         get_dividend_history_tool(),
+        # Extended fundamental tools
+        get_quarterly_earnings_tool(),
+        get_ownership_tool(),
+        get_corporate_actions_tool(),
+        # IDX Official tools
+        get_financial_report_tool(),
+        get_company_profile_tool(),
         get_breakout_detection_tool(),
         get_divergence_detection_tool(),
         # Intraday tools
@@ -121,6 +137,13 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             "get_earnings_growth": get_earnings_growth,
             "get_analyst_ratings": get_analyst_ratings,
             "get_dividend_history": get_dividend_history,
+            # Extended fundamental tools
+            "get_quarterly_earnings": get_quarterly_earnings,
+            "get_ownership_info": get_ownership_info,
+            "get_corporate_actions": get_corporate_actions,
+            # IDX Official tools
+            "get_financial_report": get_financial_report,
+            "get_company_profile": get_company_profile,
             "get_breakout_detection": get_breakout_detection,
             "get_divergence_detection": get_divergence_detection,
             # Intraday tools
