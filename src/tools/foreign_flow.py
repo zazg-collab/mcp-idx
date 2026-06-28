@@ -660,6 +660,190 @@ def _money_flow_signal(cmf: float, mfi: float, obv_trend_pct: float, vwap_dev_pc
     return {"score": normalized, "label": label, "raw_score": score}
 
 
+def _score_phase_window(window: pd.DataFrame) -> dict:
+    """
+    Hitung phase scores untuk satu window DataFrame yang sudah memiliki
+    kolom: Returns, Volume_Ratio, Close_Position, Daily_Range, Avg_Range, Price_MA, MA_Slope.
+
+    Returns dict: phase, scores, price_trend, confidence.
+    """
+    if len(window) < 5:
+        return {"phase": "UNKNOWN", "scores": {}, "price_trend": 0.0, "confidence": "LOW"}
+
+    ma_slope = window['MA_Slope'].iloc[-1] * 100 if not pd.isna(window['MA_Slope'].iloc[-1]) else 0
+    current_vs_ma = window['Close'].iloc[-1] > window['Price_MA'].iloc[-1]
+
+    first_price = window['Close'].iloc[0]
+    price_trend = ((window['Close'].iloc[-1] - first_price) / first_price * 100) if first_price > 0 else 0.0
+
+    acc = dist = markup = markdown = 0.0
+    consecutive_down = 0
+
+    for _, row in window.iterrows():
+        ret       = row['Returns'] * 100 if not pd.isna(row['Returns']) else 0
+        vol_ratio = row['Volume_Ratio'] if not pd.isna(row['Volume_Ratio']) else 1.0
+        close_pos = row['Close_Position'] if not pd.isna(row['Close_Position']) else 0.5
+        d_range   = row['Daily_Range'] if not pd.isna(row['Daily_Range']) else 2.0
+        avg_range = row['Avg_Range'] if not pd.isna(row['Avg_Range']) else 2.0
+        above_ma  = row['Close'] > row['Price_MA'] if not pd.isna(row['Price_MA']) else True
+
+        if vol_ratio > 1.2:
+            vol_regime, weight = 'HIGH', 1.0
+        elif vol_ratio < 0.8:
+            vol_regime, weight = 'LOW', 0.5
+        else:
+            vol_regime, weight = 'NEUTRAL', 0.35
+
+        # Accumulation
+        if vol_regime == 'HIGH' and -2 < ret < 2:
+            acc += 1.0
+        elif vol_regime == 'NEUTRAL' and d_range < avg_range and close_pos > 0.6 and ret > -1:
+            acc += 0.5
+        elif vol_regime in ('HIGH', 'NEUTRAL') and -3 < ret < 0 and close_pos > 0.7:
+            acc += weight * 0.7
+
+        # Markup
+        if vol_regime == 'HIGH' and ret > 2:
+            markup += 1.0
+        elif vol_regime == 'NEUTRAL' and ret > 1.5:
+            markup += 0.4
+        elif ret > 0.5 and close_pos > 0.8:
+            markup += weight * 0.5
+
+        # Distribution
+        if vol_regime == 'HIGH' and ret < -2 and above_ma:
+            dist += 1.0
+        elif vol_regime == 'HIGH' and close_pos < 0.3:
+            dist += 0.7
+        elif vol_regime == 'NEUTRAL' and close_pos < 0.3 and above_ma:
+            dist += 0.3
+
+        # Markdown
+        if ret < -0.5:
+            consecutive_down += 1
+        else:
+            consecutive_down = 0
+
+        if vol_regime == 'LOW' and ret < -2 and not above_ma:
+            markdown += 1.0
+        elif vol_regime == 'HIGH' and ret < -3 and not above_ma:
+            markdown += 1.2
+        elif consecutive_down >= 2 and not above_ma:
+            markdown += 0.6
+        elif consecutive_down >= 3:
+            markdown += 0.8
+        elif not above_ma and ma_slope < -0.5 and ret < -1:
+            markdown += 0.5
+
+        if close_pos < 0.2 and ret < 0:
+            markdown += 0.3
+
+    # Bonus confirmations
+    if not current_vs_ma and price_trend < -5 and ma_slope < 0:
+        markdown += 2.0
+    if current_vs_ma and price_trend > 5 and ma_slope > 0:
+        markup += 1.5
+
+    scores = {
+        'ACCUMULATION': round(acc, 1),
+        'MARKUP':       round(markup, 1),
+        'DISTRIBUTION': round(dist, 1),
+        'MARKDOWN':     round(markdown, 1),
+    }
+    max_score    = max(scores.values())
+    second_best  = sorted(scores.values(), reverse=True)[1]
+    margin       = max_score - second_best
+    total_score  = sum(scores.values())
+    margin_pct   = (margin / total_score * 100) if total_score > 0 else 0
+
+    if max_score < 2 or (margin < 2 and margin_pct < 25):
+        phase = 'TRANSITION'
+    else:
+        phase = max(scores, key=scores.get)
+
+    confidence = (
+        "HIGH"     if max_score >= 5 and margin >= 3 else
+        "MODERATE" if max_score >= 3 and margin >= 2 else
+        "LOW"
+    )
+
+    return {
+        "phase":       phase,
+        "scores":      scores,
+        "price_trend": round(price_trend, 2),
+        "confidence":  confidence,
+    }
+
+
+def _build_phase_history(hist: pd.DataFrame) -> list[dict]:
+    """
+    Bagi hist menjadi 3 window (~early / mid / recent) dan deteksi fase tiap window.
+    Gunakan untuk melihat trajectory fase: ACCUMULATION → MARKUP → DISTRIBUTION dst.
+    """
+    n = len(hist)
+    if n < 30:
+        return []
+
+    # Bagi ke 3 segmen berukuran sama
+    seg = n // 3
+    windows = [
+        ("early",  hist.iloc[:seg]),
+        ("mid",    hist.iloc[seg: seg * 2]),
+        ("recent", hist.iloc[seg * 2:]),
+    ]
+
+    history = []
+    _phase_emoji = {
+        "ACCUMULATION": "🟢",
+        "MARKUP":       "🔥",
+        "DISTRIBUTION": "🔴",
+        "MARKDOWN":     "⚪",
+        "TRANSITION":   "🟡",
+        "UNKNOWN":      "❓",
+    }
+
+    for label, window in windows:
+        result = _score_phase_window(window)
+        start_date = str(window.index[0])[:10]  if hasattr(window.index[0], 'date') else str(window.index[0])[:10]
+        end_date   = str(window.index[-1])[:10] if hasattr(window.index[-1], 'date') else str(window.index[-1])[:10]
+        phase = result["phase"]
+        history.append({
+            "window":      label,
+            "date_range":  f"{start_date} → {end_date}",
+            "phase":       phase,
+            "emoji":       _phase_emoji.get(phase, "❓"),
+            "price_trend": result["price_trend"],
+            "confidence":  result["confidence"],
+            "scores":      result["scores"],
+        })
+
+    # Trajectory string: "🟢 ACCUM → 🔥 MARKUP → 🔴 DIST"
+    trajectory = " → ".join(
+        f"{h['emoji']} {h['phase']}" for h in history
+    )
+
+    # Analisis momentum: apakah fase sedang membaik atau memburuk?
+    phase_rank = {"ACCUMULATION": 1, "MARKUP": 2, "TRANSITION": 1.5,
+                  "DISTRIBUTION": 3, "MARKDOWN": 4, "UNKNOWN": 0}
+    ranks = [phase_rank.get(h["phase"], 0) for h in history]
+    if ranks[-1] > ranks[0]:
+        momentum = "DETERIORATING"   # Makin ke kanan makin jelek (menuju markdown)
+    elif ranks[-1] < ranks[0]:
+        momentum = "IMPROVING"       # Makin ke kanan makin bagus (menuju markup)
+    else:
+        momentum = "STABLE"
+
+    return {
+        "windows":    history,
+        "trajectory": trajectory,
+        "momentum":   momentum,
+        "note": (
+            "IMPROVING = fase membaik (menuju akumulasi/markup). "
+            "DETERIORATING = fase memburuk (menuju distribusi/markdown)."
+        ),
+    }
+
+
 def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
     """
     Analisis pola akumulasi/distribusi bandar berdasarkan price-volume action.
@@ -922,6 +1106,9 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
 
         mf_signal = _money_flow_signal(cmf_now, mfi_now, obv_trend_pct, vwap_dev_pct)
 
+        # ── Phase History ──────────────────────────────────────────────────────
+        phase_history = _build_phase_history(hist)
+
         # ── Divergence Detection ───────────────────────────────────────────────
         divergence = _detect_divergence(hist, obv_series, cmf_series, mfi_series, window=10)
 
@@ -965,6 +1152,7 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
                 "distribution": scores['DISTRIBUTION'],
                 "markdown": scores['MARKDOWN']
             },
+            "phase_history": phase_history,
             "divergence": divergence,
             "money_flow_indicators": {
                 "composite": mf_signal,
