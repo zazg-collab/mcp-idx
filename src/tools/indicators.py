@@ -25,7 +25,7 @@ def get_technical_indicators_tool() -> Tool:
                 "indicators": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List indikator (rsi, macd, sma_20, ema_50, bbands, stoch, atr, obv, vwap, adx, ichimoku)",
+                    "description": "List indikator (rsi, macd, sma_20, ema_50, bbands, stoch, stoch_slow, stoch_rsi, atr, obv, vwap, adx, ichimoku, williams_r, cci, ma_ribbon, volume_profile)",
                     "default": settings.DEFAULT_INDICATORS,
                 },
                 "period": {
@@ -293,6 +293,180 @@ def calculate_indicators(df: pd.DataFrame, indicators: List[str]) -> Dict[str, A
                                 "signal": signal,
                                 "data_complete": senkou_a_valid and senkou_b_valid,
                             }
+
+            elif ind == "stoch_slow":
+                stoch_slow = ta.stoch(high, low, close, k=10, d=5, smooth_k=5)
+                if stoch_slow is not None and not stoch_slow.empty:
+                    stoch_slow_k = stoch_slow["STOCHk_10_5_5"].iloc[-1]
+                    stoch_slow_d = stoch_slow["STOCHd_10_5_5"].iloc[-1]
+                    # NaN guard
+                    if pd.notna(stoch_slow_k) and pd.notna(stoch_slow_d):
+                        k_val = round(float(stoch_slow_k), 2)
+                        d_val = round(float(stoch_slow_d), 2)
+                        interpretation = (
+                            "overbought" if k_val > 80
+                            else "oversold" if k_val < 20
+                            else "neutral"
+                        )
+                        result["stoch_slow"] = {
+                            "k": k_val,
+                            "d": d_val,
+                            "interpretation": interpretation,
+                        }
+
+            elif ind == "stoch_rsi":
+                stoch_rsi = ta.stochrsi(close)
+                if stoch_rsi is not None and not stoch_rsi.empty:
+                    stochrsi_k = stoch_rsi.iloc[:, 0].iloc[-1]
+                    stochrsi_d = stoch_rsi.iloc[:, 1].iloc[-1]
+                    # NaN guard
+                    if pd.notna(stochrsi_k) and pd.notna(stochrsi_d):
+                        k_val = round(float(stochrsi_k), 2)
+                        d_val = round(float(stochrsi_d), 2)
+                        interpretation = (
+                            "overbought" if k_val > 80
+                            else "oversold" if k_val < 20
+                            else "neutral"
+                        )
+                        result["stoch_rsi"] = {
+                            "k": k_val,
+                            "d": d_val,
+                            "interpretation": interpretation,
+                        }
+
+            elif ind == "williams_r":
+                willr = ta.willr(high, low, close, length=14)
+                if willr is not None and not willr.empty:
+                    willr_value = willr.iloc[-1]
+                    # NaN guard
+                    if pd.notna(willr_value):
+                        willr_val = round(float(willr_value), 2)
+                        interpretation = (
+                            "overbought" if willr_val > -20
+                            else "oversold" if willr_val < -80
+                            else "neutral"
+                        )
+                        result["williams_r"] = {
+                            "value": willr_val,
+                            "interpretation": interpretation,
+                        }
+
+            elif ind == "cci":
+                cci14 = ta.cci(high, low, close, length=14)
+                cci20 = ta.cci(high, low, close, length=20)
+                cci_result = {}
+                if cci14 is not None and not cci14.empty:
+                    cci14_value = cci14.iloc[-1]
+                    if pd.notna(cci14_value):
+                        cci_result["cci_14"] = round(float(cci14_value), 2)
+                if cci20 is not None and not cci20.empty:
+                    cci20_value = cci20.iloc[-1]
+                    if pd.notna(cci20_value):
+                        cci_result["cci_20"] = round(float(cci20_value), 2)
+                if cci_result:
+                    ref_value = cci_result.get("cci_14", cci_result.get("cci_20", 0))
+                    # Deteksi extreme price swing — CCI jadi tidak reliable
+                    # karena SMA typical price dalam periode jauh di atas harga saat ini
+                    try:
+                        current_px = float(close.iloc[-1])
+                        period_high = float(high.max())
+                        period_low = float(low.min())
+                        price_range_pct = (period_high - period_low) / current_px * 100
+                        extreme_swing = price_range_pct > 100 or abs(ref_value) > 300
+                    except Exception:
+                        extreme_swing = abs(ref_value) > 300
+                        price_range_pct = 0
+                    if extreme_swing:
+                        cci_result["interpretation"] = "unreliable"
+                        cci_result["warning"] = (
+                            f"CCI tidak akurat — extreme price swing terdeteksi "
+                            f"(range {price_range_pct:.0f}% dari harga saat ini). "
+                            f"Gunakan period='1mo' untuk hasil lebih valid."
+                        )
+                    else:
+                        cci_result["interpretation"] = (
+                            "overbought" if ref_value > 100
+                            else "oversold" if ref_value < -100
+                            else "neutral"
+                        )
+                    result["cci"] = cci_result
+
+            elif ind == "volume_profile":
+                # Volume Profile: POC, VAH, VAL (70% value area)
+                import numpy as np
+                _close_vp = close.dropna().values.astype(float)
+                _vol_vp   = volume.reindex(close.dropna().index).fillna(0).values.astype(float)
+                if len(_close_vp) >= 5:
+                    n_bins = 20
+                    p_min = float(_close_vp.min())
+                    p_max = float(_close_vp.max())
+                    if p_max > p_min:
+                        bins     = np.linspace(p_min, p_max, n_bins + 1)
+                        bin_vol  = np.zeros(n_bins)
+                        for _i in range(len(_close_vp)):
+                            _idx = int((_close_vp[_i] - p_min) / (p_max - p_min) * n_bins)
+                            _idx = max(0, min(n_bins - 1, _idx))
+                            bin_vol[_idx] += _vol_vp[_i]
+                        bin_mid = (bins[:-1] + bins[1:]) / 2
+                        poc_idx = int(np.argmax(bin_vol))
+                        poc     = float(bin_mid[poc_idx])
+                        # Value Area 70%
+                        total_vol  = float(bin_vol.sum())
+                        target_vol = total_vol * 0.70
+                        sorted_idx = np.argsort(bin_vol)[::-1]
+                        accum, va_idx = 0.0, []
+                        for _i in sorted_idx:
+                            accum += float(bin_vol[_i])
+                            va_idx.append(int(_i))
+                            if accum >= target_vol:
+                                break
+                        va_prices = bin_mid[va_idx]
+                        vah = float(va_prices.max())
+                        val = float(va_prices.min())
+                        # Price vs POC
+                        cur_px   = float(_close_vp[-1])
+                        thresh   = (p_max - p_min) / n_bins
+                        pvs_poc  = ("above_poc" if cur_px > poc + thresh
+                                    else "below_poc" if cur_px < poc - thresh
+                                    else "at_poc")
+                        result["volume_profile"] = {
+                            "poc": round(poc, 2),
+                            "vah": round(vah, 2),
+                            "val": round(val, 2),
+                            "value_area_pct": 70.0,
+                            "price_vs_poc": pvs_poc,
+                        }
+
+            elif ind == "ma_ribbon":
+                ribbon = {}
+                # SMA ribbon: 5, 10, 20, 50, 100, 200
+                for period in [5, 10, 20, 50, 100, 200]:
+                    sma = ta.sma(close, length=period)
+                    if sma is not None and not sma.empty:
+                        sma_value = sma.iloc[-1]
+                        ribbon[f"sma_{period}"] = round(float(sma_value), 2) if pd.notna(sma_value) else None
+                    else:
+                        ribbon[f"sma_{period}"] = None
+                # EMA ribbon: 9, 21, 55, 89, 200
+                for period in [9, 21, 55, 89, 200]:
+                    ema = ta.ema(close, length=period)
+                    if ema is not None and not ema.empty:
+                        ema_value = ema.iloc[-1]
+                        ribbon[f"ema_{period}"] = round(float(ema_value), 2) if pd.notna(ema_value) else None
+                    else:
+                        ribbon[f"ema_{period}"] = None
+                # Count alignment
+                current_price_ribbon = float(close.iloc[-1])
+                ma_above = sum(1 for v in ribbon.values() if v is not None and current_price_ribbon > v)
+                ma_total = sum(1 for v in ribbon.values() if v is not None)
+                ribbon["price_above_count"] = ma_above
+                ribbon["total_ma_count"] = ma_total
+                ribbon["alignment"] = (
+                    "bullish" if ma_total > 0 and ma_above == ma_total
+                    else "bearish" if ma_above == 0
+                    else "mixed"
+                )
+                result["ma_ribbon"] = ribbon
 
         except Exception:
             # Skip indicators that fail to calculate

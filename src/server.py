@@ -45,6 +45,7 @@ from src.tools.idx_official import (
     get_company_profile_tool, get_company_profile,
 )
 from src.tools.breakout import get_breakout_detection_tool, get_breakout_detection
+from src.tools.bulk_screener import get_bulk_screener_tool, screen_idx_bulk_handler
 from src.tools.divergence import get_divergence_detection_tool, get_divergence_detection
 from src.tools.intraday import (
     get_vwap_tool, get_vwap,
@@ -105,6 +106,7 @@ async def handle_list_tools() -> list[Tool]:
         get_company_profile_tool(),
         get_breakout_detection_tool(),
         get_divergence_detection_tool(),
+        get_bulk_screener_tool(),
         # Intraday tools
         get_vwap_tool(),
         get_pivot_points_tool(),
@@ -153,6 +155,8 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             "get_vwap": get_vwap,
             "get_pivot_points": get_pivot_points,
             "get_gap_analysis": get_gap_analysis,
+            # Bulk screener
+            "screen_idx_bulk": screen_idx_bulk_handler,
         }
         
         handler = tool_handlers.get(name)

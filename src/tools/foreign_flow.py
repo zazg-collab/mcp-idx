@@ -9,6 +9,7 @@ from ..utils.helpers import format_ticker
 from mcp.types import Tool
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 
 # Initialize API
@@ -983,6 +984,213 @@ def _build_phase_history(hist: pd.DataFrame) -> list[dict]:
     }
 
 
+def _calc_smart_money_score(hist: pd.DataFrame) -> dict:
+    """
+    Proxy for broker accumulation using price-volume logic.
+    Score 0-100: >60 = smart money accumulating, <40 = distributing.
+
+    Components (each 0-20 points):
+    1. CMF_TREND: CMF positive + increasing over last 10 bars → +20
+    2. OBV_DIVERGENCE: OBV rising while price neutral/down → +20 (classic accumulation)
+    3. PRICE_CONTRACTION: Low volatility + tight range (price coiling) → +20
+    4. VOLUME_ON_UP_DAYS: Avg volume on up days > avg volume on down days → +20
+    5. CLOSING_STRENGTH: Closes in upper 50% of day's range on avg → +20
+    """
+    score = 0
+    components = {}
+
+    close  = hist["Close"]
+    high   = hist["High"]
+    low    = hist["Low"]
+    volume = hist["Volume"]
+
+    # 1. CMF Trend
+    try:
+        cmf = _calc_cmf(hist, window=20)
+        if len(cmf.dropna()) >= 10:
+            cmf_recent = float(cmf.dropna().iloc[-1])
+            cmf_prev   = float(cmf.dropna().iloc[-10])
+            cmf_score  = (20 if (cmf_recent > 0 and cmf_recent > cmf_prev) else
+                          10 if cmf_recent > 0 else
+                          5  if cmf_recent > cmf_prev else 0)
+            score += cmf_score
+            components["cmf_trend"] = {"value": round(cmf_recent, 3), "score": cmf_score}
+    except Exception as e:
+        components["cmf_trend"] = {"error": str(e)}
+
+    # 2. OBV Divergence
+    try:
+        obv = _calc_obv(hist)
+        if len(obv) >= 20:
+            obv_change   = float((obv.iloc[-1] - obv.iloc[-20]) / (abs(obv.iloc[-20]) + 1) * 100)
+            price_change = float((close.iloc[-1] - close.iloc[-20]) / close.iloc[-20] * 100)
+            div_score = (20 if (obv_change > 5 and price_change < 2) else
+                         15 if (obv_change > 2 and price_change < -2) else
+                         10 if obv_change > 0 else 0)
+            score += div_score
+            components["obv_divergence"] = {
+                "obv_change_pct":   round(obv_change, 2),
+                "price_change_pct": round(price_change, 2),
+                "score":            div_score,
+            }
+    except Exception as e:
+        components["obv_divergence"] = {"error": str(e)}
+
+    # 3. Price Contraction (low ATR relative to recent history)
+    try:
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14, min_periods=1).mean()
+        atr_clean = atr.dropna()
+        if len(atr_clean) >= 20:
+            atr_recent = float(atr_clean.iloc[-5:].mean())
+            atr_hist   = float(atr_clean.iloc[-20:-5].mean())
+            atr_ratio  = atr_recent / (atr_hist + 0.001)
+            contr_score = 20 if atr_ratio < 0.7 else 10 if atr_ratio < 0.9 else 0
+            score += contr_score
+            components["price_contraction"] = {"atr_ratio": round(atr_ratio, 3), "score": contr_score}
+    except Exception as e:
+        components["price_contraction"] = {"error": str(e)}
+
+    # 4. Volume on Up Days vs Down Days (last 20 bars)
+    try:
+        if len(hist) >= 20:
+            recent    = hist.iloc[-20:]
+            up_days   = recent[recent["Close"] >= recent["Open"]]
+            down_days = recent[recent["Close"] <  recent["Open"]]
+            avg_up_vol   = float(up_days["Volume"].mean())   if len(up_days)   > 0 else 0.0
+            avg_down_vol = float(down_days["Volume"].mean()) if len(down_days) > 0 else 0.0
+            up_vol_ratio = avg_up_vol / (avg_down_vol + 1)
+            up_vol_score = 20 if up_vol_ratio > 1.5 else 10 if up_vol_ratio > 1.1 else 0
+            score += up_vol_score
+            components["volume_on_up_days"] = {
+                "avg_up_vol":   int(avg_up_vol),
+                "avg_down_vol": int(avg_down_vol),
+                "ratio":        round(up_vol_ratio, 2),
+                "score":        up_vol_score,
+            }
+    except Exception as e:
+        components["volume_on_up_days"] = {"error": str(e)}
+
+    # 5. Closing Strength (close position in bar's range)
+    try:
+        if len(hist) >= 20:
+            recent    = hist.iloc[-20:]
+            ranges    = recent["High"] - recent["Low"]
+            close_pos = (recent["Close"] - recent["Low"]) / ranges.replace(0, np.nan)
+            avg_close_pos = float(close_pos.mean())
+            close_score = 20 if avg_close_pos > 0.65 else 10 if avg_close_pos > 0.50 else 0
+            score += close_score
+            components["closing_strength"] = {
+                "avg_close_position": round(avg_close_pos, 3),
+                "score":              close_score,
+            }
+    except Exception as e:
+        components["closing_strength"] = {"error": str(e)}
+
+    # Interpretation
+    if score >= 70:
+        interpretation = "STRONG_ACCUMULATION"
+        label = "🔥 Smart money agresif akumulasi"
+    elif score >= 50:
+        interpretation = "ACCUMULATION"
+        label = "🟢 Tanda-tanda akumulasi"
+    elif score >= 30:
+        interpretation = "NEUTRAL"
+        label = "🟡 Tidak ada sinyal jelas"
+    elif score >= 15:
+        interpretation = "DISTRIBUTION"
+        label = "🟠 Tanda-tanda distribusi"
+    else:
+        interpretation = "STRONG_DISTRIBUTION"
+        label = "🔴 Smart money distribusi agresif"
+
+    return {
+        "score":          score,
+        "max_score":      100,
+        "interpretation": interpretation,
+        "label":          label,
+        "components":     components,
+    }
+
+
+def _calc_net_flow_weekly(hist: pd.DataFrame) -> dict:
+    """
+    Net flow per week = sum of (signed volume) for each bar.
+    Signed volume = +volume if close >= open (buying pressure), -volume if close < open.
+
+    Returns last 8 weeks with weekly net flow and cumulative trend.
+    """
+    hist = hist.copy()
+    # Use Date column as index if available (yfinance data via YahooFinanceClient
+    # returns a numeric index with a 'Date' column after capitalize())
+    if "Date" in hist.columns:
+        hist = hist.set_index("Date")
+    hist.index = pd.to_datetime(hist.index)
+    hist["signed_vol"] = np.where(
+        hist["Close"] >= hist["Open"],
+        hist["Volume"],
+        -hist["Volume"],
+    )
+
+    # Resample to weekly (Sunday-anchored, covers Mon-Fri trading weeks)
+    weekly       = hist["signed_vol"].resample("W").sum()
+    weekly_vol   = hist["Volume"].resample("W").sum()
+    weekly_close = hist["Close"].resample("W").last()
+
+    weeks       = weekly.tail(8)
+    weeks_vol   = weekly_vol.tail(8)
+    weeks_close = weekly_close.tail(8)
+
+    rows = []
+    for date, net_flow in weeks.items():
+        week_vol   = weeks_vol.get(date, 0)
+        week_close = weeks_close.get(date)
+        net_ratio  = round(float(net_flow) / (float(week_vol) + 1), 4)  # -1 to +1
+        rows.append({
+            "week":         str(date)[:10],
+            "net_flow":     int(net_flow),
+            "total_volume": int(week_vol),
+            "net_ratio":    net_ratio,
+            "close":        round(float(week_close), 2) if week_close is not None and not pd.isna(week_close) else None,
+            "signal":       "BUY" if net_ratio > 0.1 else "SELL" if net_ratio < -0.1 else "NEUTRAL",
+        })
+
+    # Overall trend
+    if len(rows) >= 4:
+        recent_4w   = [r["net_ratio"] for r in rows[-4:]]
+        avg_recent  = sum(recent_4w) / len(recent_4w)
+        buy_weeks   = sum(1 for r in rows if r["net_ratio"] > 0.05)
+        sell_weeks  = sum(1 for r in rows if r["net_ratio"] < -0.05)
+
+        if avg_recent > 0.15:
+            trend = "CONSISTENT_BUYING"
+        elif avg_recent > 0.05:
+            trend = "SLIGHT_BUYING"
+        elif avg_recent < -0.15:
+            trend = "CONSISTENT_SELLING"
+        elif avg_recent < -0.05:
+            trend = "SLIGHT_SELLING"
+        else:
+            trend = "MIXED"
+    else:
+        trend      = "INSUFFICIENT_DATA"
+        buy_weeks  = sell_weeks = 0
+        avg_recent = 0.0
+
+    return {
+        "weekly":            rows,
+        "trend_8w":          trend,
+        "buy_weeks_8w":      buy_weeks,
+        "sell_weeks_8w":     sell_weeks,
+        "avg_net_ratio_4w":  round(avg_recent, 4),
+    }
+
+
 def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
     """
     Analisis pola akumulasi/distribusi bandar berdasarkan price-volume action.
@@ -1279,6 +1487,18 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
         mf_boost = mf_signal['raw_score'] * 1.5  # -12..+12 contribution
         bandar_strength = max(0, min(100, bandar_strength + mf_boost + div_adjustment))
 
+        # ── Smart Money Score ──────────────────────────────────────────────────
+        try:
+            smart_money = _calc_smart_money_score(hist)
+        except Exception as e:
+            smart_money = {"error": str(e)}
+
+        # ── Net Flow Trend Multi-Week ──────────────────────────────────────────
+        try:
+            net_flow = _calc_net_flow_weekly(hist)
+        except Exception as e:
+            net_flow = {"error": str(e)}
+
         return {
             "ticker": ticker.replace('.JK', ''),
             "analysis_period": period,
@@ -1351,7 +1571,9 @@ def analyze_bandarmology(ticker: str, period: str = "3mo") -> dict:
                 "action": "BUY" if current_phase == 'ACCUMULATION' else "HOLD/RIDE" if current_phase == 'MARKUP' else "SELL" if current_phase == 'DISTRIBUTION' else "WAIT" if current_phase == 'TRANSITION' else "AVOID",
                 "reason": phase_signal.get(current_phase, '🟡 WAIT - Fase transisi'),
                 "risk_level": "LOW" if current_phase == 'ACCUMULATION' else "MODERATE" if current_phase in ['MARKUP', 'TRANSITION'] else "HIGH"
-            }
+            },
+            "smart_money_score": smart_money,
+            "net_flow_weekly": net_flow,
         }
         
     except Exception as e:

@@ -75,11 +75,17 @@ class IndicatorsValidator(BaseModel):
             "ema_50",
             "bbands",
             "stoch",
+            "stoch_slow",
+            "stoch_rsi",
             "atr",
             "obv",
             "vwap",
             "adx",
             "ichimoku",
+            "williams_r",
+            "cci",
+            "ma_ribbon",
+            "volume_profile",
         ]
         invalid = [ind for ind in v if ind not in valid_indicators]
         if invalid:
