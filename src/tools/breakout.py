@@ -179,7 +179,44 @@ def detect_breakout(
     avg_volume = float(df['Volume'].tail(20).mean())
     volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
     volume_confirmed = volume_ratio >= volume_threshold
-    
+
+    # V60 — 60-day volume SMA (CIA Kamehameha standard)
+    has_v60_data = len(df) >= 60
+    avg_volume_v60 = float(df['Volume'].tail(60).mean()) if has_v60_data else avg_volume
+    volume_vs_v60 = current_volume / avg_volume_v60 if avg_volume_v60 > 0 else 0
+    is_kame_volume = volume_vs_v60 >= 2.5  # CIA Kamehameha: volume > 2.5× V60
+
+    # V60 confirmation fields
+    if not has_v60_data:
+        vol_ratio_v60 = None
+        volume_strength = "NO_DATA"
+        volume_confirmed_v60 = False
+    else:
+        vol_ratio_v60 = round(volume_vs_v60, 2)
+        if volume_vs_v60 >= 2.0:
+            volume_strength = "STRONG"
+            volume_confirmed_v60 = True
+        elif volume_vs_v60 >= 1.5:
+            volume_strength = "CONFIRMED"
+            volume_confirmed_v60 = True
+        else:
+            volume_strength = "UNCONFIRMED"
+            volume_confirmed_v60 = False
+
+    # Pre-breakout volume trend (last 5 bars excluding current)
+    pre_vol = list(df['Volume'].tail(6).iloc[:-1])
+    if len(pre_vol) >= 3:
+        rising_steps = sum(1 for i in range(1, len(pre_vol)) if pre_vol[i] > pre_vol[i-1])
+        falling_steps = sum(1 for i in range(1, len(pre_vol)) if pre_vol[i] < pre_vol[i-1])
+        if rising_steps >= 3:
+            vol_trend = "rising"
+        elif falling_steps >= 3:
+            vol_trend = "falling"
+        else:
+            vol_trend = "mixed"
+    else:
+        vol_trend = "unknown"
+
     # Determine breakout status
     breakout_type = None
     breakout_price = None
@@ -338,6 +375,14 @@ def detect_breakout(
         "volume_ratio": round(volume_ratio, 2),
         "volume_confirmed": volume_confirmed,
         "avg_volume": round(avg_volume, 0),
+        "avg_volume_v60": round(avg_volume_v60, 0),
+        "volume_vs_v20": round(volume_ratio, 2),
+        "volume_vs_v60": round(volume_vs_v60, 2),
+        "vol_ratio_v60": vol_ratio_v60,
+        "volume_strength": volume_strength,
+        "volume_confirmed_v60": volume_confirmed_v60,
+        "is_kame_volume": is_kame_volume,
+        "pre_breakout_vol_trend": vol_trend,
         "current_volume": round(current_volume, 0),
         "targets": targets,
         "stop_loss": stop_loss,
@@ -566,6 +611,19 @@ async def get_breakout_detection(arguments: dict) -> Dict[str, Any]:
             for warning in false_breakout['warnings']:
                 insights.append(f"  - {warning}")
         
+        # Volume confirmation summary
+        vol_strength = breakout.get("volume_strength", "NO_DATA")
+        vol_confirmed_v60 = breakout.get("volume_confirmed_v60", False)
+        vol_ratio_v60 = breakout.get("vol_ratio_v60", None)
+        volume_summary = {
+            "vol_ratio_v60": vol_ratio_v60,
+            "volume_strength": vol_strength,
+            "volume_confirmed_v60": vol_confirmed_v60,
+            "confirmed_count": 1 if vol_strength in ("CONFIRMED", "STRONG") else 0,
+            "strong_count": 1 if vol_strength == "STRONG" else 0,
+            "v60_available": vol_ratio_v60 is not None,
+        }
+
         return {
             "ticker": ticker,
             "analysis_date": str(df.index[-1].date()),
@@ -576,6 +634,7 @@ async def get_breakout_detection(arguments: dict) -> Dict[str, Any]:
             "breakout_analysis": breakout,
             "false_breakout_check": false_breakout,
             "signal": signal_result,
+            "volume_confirmation_summary": volume_summary,
             "insights": insights,
             "atr_info": {
                 "atr_14": round(atr, 2) if atr > 0 else None,
