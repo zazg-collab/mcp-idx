@@ -10,10 +10,274 @@ from mcp.types import Tool
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 # Initialize API
 yahoo_api = YahooFinanceClient()
+
+# ─── Sector peer mapping (IDX) ────────────────────────────────────────────────
+IDX_SECTOR_PEERS: Dict[str, List[str]] = {
+    "Financial Services": ["BBCA", "BBRI", "BMRI", "BNGA", "BBNI"],
+    "Communication Services": ["TLKM", "EXCL", "ISAT"],
+    "Consumer Defensive": ["UNVR", "ICBP", "INDF", "MYOR"],
+    "Consumer Cyclical": ["UNVR", "ICBP", "INDF", "MYOR"],
+    "Energy": ["ADRO", "PTBA", "ITMG", "BUMI"],
+    "Basic Materials": ["ADRO", "PTBA", "ITMG", "BUMI"],
+    "Real Estate": ["BSDE", "SMRA", "CTRA", "LPKR"],
+    "Technology": ["GOTO", "EMTK", "BUKA"],
+    # Fallback keys used when yfinance returns local sector names
+    "Perbankan": ["BBCA", "BBRI", "BMRI", "BNGA", "BBNI"],
+    "Telekomunikasi": ["TLKM", "EXCL", "ISAT"],
+    "Konsumer": ["UNVR", "ICBP", "INDF", "MYOR"],
+    "Energi": ["ADRO", "PTBA", "ITMG", "BUMI"],
+    "Properti": ["BSDE", "SMRA", "CTRA", "LPKR"],
+    "Teknologi": ["GOTO", "EMTK", "BUKA"],
+}
+
+BANKING_SECTORS = {"Financial Services", "Perbankan"}
+
+
+def _get_peer_pe_ratios(peers: List[str], exclude_ticker: str) -> List[float]:
+    """Fetch trailingPE for each peer (skipping the subject ticker). Returns list of valid values."""
+    pe_values: List[float] = []
+    subject = exclude_ticker.upper().replace(".JK", "")
+    for peer in peers:
+        if peer.upper() == subject:
+            continue
+        try:
+            info = yf.Ticker(f"{peer}.JK").info
+            pe = info.get("trailingPE")
+            if pe and isinstance(pe, (int, float)) and pe > 0 and pe < 1000:
+                pe_values.append(round(float(pe), 2))
+        except Exception:
+            continue
+    return pe_values
+
+
+def _sector_pe_comparison(ticker: str, info: dict) -> dict:
+    """
+    Feature 1 — Sector PE comparison.
+    Returns sector_pe_avg, sector_pe_median, pe_vs_sector.
+    """
+    result: dict = {}
+    sector = info.get("sector", "") or ""
+    result["sector"] = sector
+
+    peers = IDX_SECTOR_PEERS.get(sector, [])
+    result["sector_peers"] = peers
+
+    if not peers:
+        result["note"] = "Sector peer mapping not available"
+        return result
+
+    pe_values = _get_peer_pe_ratios(peers, ticker)
+    if not pe_values:
+        result["note"] = "No valid peer PE data available"
+        return result
+
+    sector_avg = round(sum(pe_values) / len(pe_values), 2)
+    sorted_pe = sorted(pe_values)
+    mid = len(sorted_pe) // 2
+    sector_median = (
+        round((sorted_pe[mid - 1] + sorted_pe[mid]) / 2, 2)
+        if len(sorted_pe) % 2 == 0
+        else round(sorted_pe[mid], 2)
+    )
+
+    result["sector_pe_avg"] = sector_avg
+    result["sector_pe_median"] = sector_median
+    result["peer_pe_values"] = pe_values
+
+    subject_pe = info.get("trailingPE")
+    if subject_pe and sector_avg > 0:
+        pe_premium = round(((subject_pe - sector_avg) / sector_avg) * 100, 1)
+        result["pe_vs_sector"] = pe_premium
+        result["pe_vs_sector_label"] = (
+            f"{'Discount' if pe_premium < 0 else 'Premium'} {abs(pe_premium):.1f}% vs sector avg"
+        )
+
+    return result
+
+
+def _debt_analysis(info: dict, balance_sheet) -> dict:
+    """
+    Feature 2 — Debt analysis.
+    Returns debt_to_equity, debt_to_assets, interest_coverage, net_debt_to_ebitda, debt_risk.
+    """
+    result: dict = {}
+    sector = info.get("sector", "") or ""
+    is_bank = sector in BANKING_SECTORS
+
+    # D/E from yfinance info (debtToEquity is already a ratio × 100 in yf)
+    dte_raw = info.get("debtToEquity")
+    if dte_raw is not None:
+        dte = round(float(dte_raw) / 100, 4)   # convert to plain ratio (e.g. 0.8)
+        result["debt_to_equity"] = round(dte, 2)
+    else:
+        dte = None
+
+    # D/A — compute from balance sheet if available
+    if balance_sheet is not None and not balance_sheet.empty:
+        try:
+            latest = balance_sheet.columns[0]
+            total_liab = (
+                float(balance_sheet.loc["Total Liabilities Net Minority Interest", latest])
+                if "Total Liabilities Net Minority Interest" in balance_sheet.index else None
+            )
+            total_assets = (
+                float(balance_sheet.loc["Total Assets", latest])
+                if "Total Assets" in balance_sheet.index else None
+            )
+            if total_liab is not None and total_assets and total_assets > 0:
+                result["debt_to_assets"] = round(total_liab / total_assets, 4)
+        except Exception:
+            pass
+
+    # Interest coverage from yfinance info fields
+    ebit = info.get("ebit")
+    interest_expense = info.get("totalInterestExpense") or info.get("interestExpense")
+    if ebit and interest_expense and interest_expense != 0:
+        ic = round(float(ebit) / abs(float(interest_expense)), 2)
+        result["interest_coverage"] = ic
+
+    # Net debt / EBITDA
+    total_debt = info.get("totalDebt")
+    cash = info.get("totalCash")
+    ebitda = info.get("ebitda")
+    if total_debt is not None and cash is not None and ebitda and ebitda > 0:
+        net_debt = float(total_debt) - float(cash)
+        result["net_debt_to_ebitda"] = round(net_debt / float(ebitda), 2)
+
+    # Debt risk classification (skip for banks)
+    if dte is not None and not is_bank:
+        if dte < 0.5:
+            debt_risk = "LOW"
+        elif dte < 1.5:
+            debt_risk = "MODERATE"
+        elif dte < 3.0:
+            debt_risk = "HIGH"
+        else:
+            debt_risk = "VERY_HIGH"
+        result["debt_risk"] = debt_risk
+    elif is_bank:
+        result["debt_risk"] = "N/A (Banking)"
+        result["bank_note"] = "Banks inherently operate with high leverage; D/E not used for risk scoring"
+
+    return result
+
+
+def _valuation_score(
+    info: dict,
+    sector_pe_data: dict,
+    debt_data: dict,
+    yoy_revenue_growth: Optional[float],
+) -> dict:
+    """
+    Feature 3 — Composite valuation score (0-100).
+    Components: PE vs sector (20), PBV (20), ROE (20), Revenue growth YoY (20), Debt risk (20).
+    """
+    score = 0
+    breakdown: dict = {}
+    sector = info.get("sector", "") or ""
+    is_bank = sector in BANKING_SECTORS
+
+    # 1. PE vs sector (20 pts)
+    pe_vs_sector = sector_pe_data.get("pe_vs_sector")
+    if pe_vs_sector is not None:
+        if pe_vs_sector <= 0:          # at or below sector avg
+            pts = 20
+        elif pe_vs_sector <= 50:       # up to 50% premium → scale 20→10
+            pts = round(20 - (pe_vs_sector / 50) * 10, 1)
+        elif pe_vs_sector <= 100:      # 50-100% premium → scale 10→0
+            pts = round(10 - ((pe_vs_sector - 50) / 50) * 10, 1)
+        else:                          # >2× sector
+            pts = 0
+        score += pts
+        breakdown["pe_vs_sector_pts"] = pts
+    else:
+        breakdown["pe_vs_sector_pts"] = None
+
+    # 2. PBV (20 pts)
+    pbv = info.get("priceToBook")
+    if pbv is not None:
+        pbv = float(pbv)
+        if pbv < 1:
+            pts = 20
+        elif pbv < 2:
+            pts = 15
+        elif pbv < 3:
+            pts = 10
+        else:
+            pts = 5
+        score += pts
+        breakdown["pbv_pts"] = pts
+    else:
+        breakdown["pbv_pts"] = None
+
+    # 3. ROE (20 pts)
+    roe = info.get("returnOnEquity")
+    if roe is not None:
+        roe_pct = float(roe) * 100   # yfinance returns decimal
+        if roe_pct > 20:
+            pts = 20
+        elif roe_pct >= 15:
+            pts = 15
+        elif roe_pct >= 10:
+            pts = 10
+        else:
+            pts = 5
+        score += pts
+        breakdown["roe_pts"] = pts
+        breakdown["roe_pct"] = round(roe_pct, 2)
+    else:
+        breakdown["roe_pts"] = None
+
+    # 4. Revenue growth YoY (20 pts)
+    if yoy_revenue_growth is not None:
+        if yoy_revenue_growth > 20:
+            pts = 20
+        elif yoy_revenue_growth >= 10:
+            pts = 15
+        elif yoy_revenue_growth >= 0:
+            pts = 10
+        else:
+            pts = 0
+        score += pts
+        breakdown["revenue_growth_pts"] = pts
+        breakdown["revenue_growth_pct"] = round(yoy_revenue_growth, 2)
+    else:
+        breakdown["revenue_growth_pts"] = None
+
+    # 5. Debt risk (20 pts) — banks get neutral 15 pts
+    debt_risk = debt_data.get("debt_risk", "")
+    if is_bank:
+        pts = 15
+    elif debt_risk == "LOW":
+        pts = 20
+    elif debt_risk == "MODERATE":
+        pts = 15
+    elif debt_risk == "HIGH":
+        pts = 5
+    elif debt_risk == "VERY_HIGH":
+        pts = 0
+    else:
+        pts = 0
+    score += pts
+    breakdown["debt_risk_pts"] = pts
+
+    # Determine label
+    if score >= 70:
+        label = "UNDERVALUED"
+    elif score >= 50:
+        label = "FAIR"
+    else:
+        label = "OVERVALUED"
+
+    return {
+        "valuation_score": round(score, 1),
+        "valuation_label": label,
+        "score_breakdown": breakdown,
+    }
 
 
 def analyze_financial_statements(ticker: str) -> dict:
@@ -248,9 +512,39 @@ def analyze_financial_statements(ticker: str) -> dict:
             "positives": health_positives if health_positives else ["None"],
             "issues": health_issues if health_issues else ["None"]
         }
-        
+
+        # ── Feature 1: Sector PE comparison ──────────────────────────────────
+        try:
+            result['sector_pe_comparison'] = _sector_pe_comparison(ticker, info)
+        except Exception as e:
+            result['sector_pe_comparison'] = {"error": str(e)}
+
+        # ── Feature 2: Debt analysis ──────────────────────────────────────────
+        try:
+            result['debt_analysis'] = _debt_analysis(info, balance_sheet if balance_sheet is not None else None)
+        except Exception as e:
+            result['debt_analysis'] = {"error": str(e)}
+
+        # ── Feature 3: Valuation score ────────────────────────────────────────
+        try:
+            yoy_rev_growth = result.get('income_statement') and None  # default None
+            # Try to get revenue growth from income statement (2 periods needed)
+            if income_stmt is not None and not income_stmt.empty and len(income_stmt.columns) >= 2:
+                try:
+                    rev_latest = float(income_stmt.loc['Total Revenue', income_stmt.columns[0]]) if 'Total Revenue' in income_stmt.index else None
+                    rev_prev   = float(income_stmt.loc['Total Revenue', income_stmt.columns[1]]) if 'Total Revenue' in income_stmt.index else None
+                    if rev_latest and rev_prev and rev_prev != 0:
+                        yoy_rev_growth = ((rev_latest - rev_prev) / rev_prev) * 100
+                except Exception:
+                    yoy_rev_growth = None
+            sector_pe_data = result.get('sector_pe_comparison', {})
+            debt_data = result.get('debt_analysis', {})
+            result['valuation_score_data'] = _valuation_score(info, sector_pe_data, debt_data, yoy_rev_growth)
+        except Exception as e:
+            result['valuation_score_data'] = {"error": str(e)}
+
         return result
-        
+
     except Exception as e:
         return {"error": str(e)}
 

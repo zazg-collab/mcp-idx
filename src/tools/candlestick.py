@@ -17,8 +17,12 @@ def get_candlestick_patterns_tool() -> Tool:
     return Tool(
         name="get_candlestick_patterns",
         description=(
-            "Detect candlestick patterns (Doji, Hammer, Shooting Star, Engulfing, Marubozu, etc.) "
-            "untuk Indonesian stocks. Includes trend context validation dan volume confirmation. "
+            "Detect candlestick patterns untuk Indonesian stocks. Supported patterns: "
+            "Doji, Hammer, Hanging Man, Shooting Star, Inverted Hammer, Marubozu, "
+            "Bullish Engulfing, Bearish Engulfing, Morning Star, Evening Star, "
+            "Three White Soldiers, Three Black Crows, Bullish Harami, Bearish Harami, "
+            "Dark Cloud Cover. "
+            "Includes trend context validation dan volume confirmation. "
             "Returns detected patterns dengan bullish/bearish signals dan validity score."
         ),
         inputSchema={
@@ -356,7 +360,7 @@ def is_evening_star(
     # Day 1: Bullish
     day1_bullish = day1_close > day1_open
     day1_body = abs(day1_close - day1_open)
-    
+
     # Guard: if Day 1 body is 0 (doji), pattern is not valid
     if day1_body == 0:
         return False
@@ -371,6 +375,127 @@ def is_evening_star(
     # Day 3 closes below middle of Day 1
     return (day1_bullish and day2_small and day3_bearish and
             day3_close < (day1_open + day1_close) / 2)
+
+
+def is_three_white_soldiers(
+    d1_open: float, d1_close: float,
+    d2_open: float, d2_close: float,
+    d3_open: float, d3_close: float
+) -> bool:
+    """
+    Detect Three White Soldiers pattern (Bullish continuation/reversal).
+
+    Three consecutive bullish candles:
+    - Each closes higher than the previous
+    - Each opens within the prior candle's body
+    """
+    # All three candles must be bullish
+    if not (d1_close > d1_open and d2_close > d2_open and d3_close > d3_open):
+        return False
+
+    # Each closes higher than the previous
+    if not (d2_close > d1_close and d3_close > d2_close):
+        return False
+
+    # Each opens within the prior candle's body
+    d2_opens_in_d1 = d1_open <= d2_open <= d1_close
+    d3_opens_in_d2 = d2_open <= d3_open <= d2_close
+
+    return d2_opens_in_d1 and d3_opens_in_d2
+
+
+def is_three_black_crows(
+    d1_open: float, d1_close: float,
+    d2_open: float, d2_close: float,
+    d3_open: float, d3_close: float
+) -> bool:
+    """
+    Detect Three Black Crows pattern (Bearish continuation/reversal).
+
+    Three consecutive bearish candles:
+    - Each closes lower than the previous
+    - Each opens within the prior candle's body
+    """
+    # All three candles must be bearish
+    if not (d1_close < d1_open and d2_close < d2_open and d3_close < d3_open):
+        return False
+
+    # Each closes lower than the previous
+    if not (d2_close < d1_close and d3_close < d2_close):
+        return False
+
+    # Each opens within the prior candle's body
+    d2_opens_in_d1 = d1_close <= d2_open <= d1_open
+    d3_opens_in_d2 = d2_close <= d3_open <= d2_open
+
+    return d2_opens_in_d1 and d3_opens_in_d2
+
+
+def is_harami(
+    prev_open: float, prev_close: float,
+    curr_open: float, curr_close: float
+) -> Tuple[bool, Optional[str]]:
+    """
+    Detect Harami pattern (inside bar reversal).
+
+    Bar 2 body completely inside Bar 1 body:
+    - Bullish Harami: Bar 1 bearish, Bar 2 bullish (body inside Bar 1)
+    - Bearish Harami: Bar 1 bullish, Bar 2 bearish (body inside Bar 1)
+
+    Returns:
+        Tuple of (is_harami: bool, direction: "bullish"/"bearish"/None)
+    """
+    prev_body_high = max(prev_open, prev_close)
+    prev_body_low = min(prev_open, prev_close)
+    curr_body_high = max(curr_open, curr_close)
+    curr_body_low = min(curr_open, curr_close)
+
+    # Bar 2 body must be completely inside Bar 1 body
+    body_inside = curr_body_high < prev_body_high and curr_body_low > prev_body_low
+
+    if not body_inside:
+        return False, None
+
+    # Bullish Harami: Bar 1 bearish, Bar 2 bullish
+    if prev_close < prev_open and curr_close > curr_open:
+        return True, "bullish"
+
+    # Bearish Harami: Bar 1 bullish, Bar 2 bearish
+    if prev_close > prev_open and curr_close < curr_open:
+        return True, "bearish"
+
+    return False, None
+
+
+def is_dark_cloud_cover(
+    prev_open: float, prev_close: float,
+    curr_open: float, curr_close: float, curr_high: float
+) -> bool:
+    """
+    Detect Dark Cloud Cover pattern (Bearish reversal).
+
+    Bar 1: Bullish candle
+    Bar 2: Opens above Bar 1 high, closes below midpoint of Bar 1 body
+    """
+    # Bar 1 must be bullish
+    if prev_close <= prev_open:
+        return False
+
+    # Bar 2 must be bearish
+    if curr_close >= curr_open:
+        return False
+
+    # Bar 2 opens above Bar 1 high
+    opens_above_bar1_high = curr_open > prev_close
+
+    # Bar 2 closes below midpoint of Bar 1 body
+    bar1_midpoint = (prev_open + prev_close) / 2
+    closes_below_midpoint = curr_close < bar1_midpoint
+
+    # Bar 2 closes above Bar 1 open (not a full engulf)
+    closes_above_bar1_open = curr_close > prev_open
+
+    return opens_above_bar1_high and closes_below_midpoint and closes_above_bar1_open
 
 
 # =============================================================================
@@ -647,7 +772,7 @@ def detect_patterns(df: pd.DataFrame, lookback_days: int = 10) -> List[Dict[str,
         ):
             is_valid = bool(trend == "uptrend" or price_pos == "above")
             strength = "very_strong" if is_valid else "strong"
-            
+
             patterns.append({
                 "pattern": "Evening Star",
                 "type": "reversal",
@@ -660,6 +785,96 @@ def detect_patterns(df: pd.DataFrame, lookback_days: int = 10) -> List[Dict[str,
                 "volume_confirmed": has_volume,
                 "description": "Strong bearish reversal - trend change likely" +
                               (" ✓" if is_valid else " ⚠️")
+            })
+
+        # THREE WHITE SOLDIERS - Bullish momentum
+        if is_three_white_soldiers(
+            prev2['Open'], prev2['Close'],
+            prev['Open'], prev['Close'],
+            curr['Open'], curr['Close']
+        ):
+            is_valid = bool(trend == "downtrend" or price_pos in ["below", "at"])
+            strength = "very_strong" if is_valid and has_high_volume else "strong" if is_valid else "medium"
+
+            patterns.append({
+                "pattern": "Three White Soldiers",
+                "type": "reversal",
+                "date": date.strftime("%Y-%m-%d"),
+                "signal": "bullish",
+                "strength": strength,
+                "trend_context": trend,
+                "price_vs_ma": price_pos,
+                "is_valid": is_valid,
+                "volume_confirmed": has_volume,
+                "description": "Strong bullish reversal - three consecutive bullish bars" +
+                              (" ✓" if is_valid else " ⚠️ Context weak")
+            })
+
+        # THREE BLACK CROWS - Bearish momentum
+        if is_three_black_crows(
+            prev2['Open'], prev2['Close'],
+            prev['Open'], prev['Close'],
+            curr['Open'], curr['Close']
+        ):
+            is_valid = bool(trend == "uptrend" or price_pos in ["above", "at"])
+            strength = "very_strong" if is_valid and has_high_volume else "strong" if is_valid else "medium"
+
+            patterns.append({
+                "pattern": "Three Black Crows",
+                "type": "reversal",
+                "date": date.strftime("%Y-%m-%d"),
+                "signal": "bearish",
+                "strength": strength,
+                "trend_context": trend,
+                "price_vs_ma": price_pos,
+                "is_valid": is_valid,
+                "volume_confirmed": has_volume,
+                "description": "Strong bearish reversal - three consecutive bearish bars" +
+                              (" ✓" if is_valid else " ⚠️ Context weak")
+            })
+
+        # HARAMI - Inside bar reversal (bullish or bearish)
+        is_haram, harami_dir = is_harami(prev['Open'], prev['Close'], curr['Open'], curr['Close'])
+        if is_haram:
+            if harami_dir == "bullish":
+                is_valid = bool(trend == "downtrend" or price_pos in ["below", "at"])
+                description = "Bullish Harami - potential bottom reversal" + (" ✓" if is_valid else " ⚠️ Context weak")
+            else:
+                is_valid = bool(trend == "uptrend" or price_pos in ["above", "at"])
+                description = "Bearish Harami - potential top reversal" + (" ✓" if is_valid else " ⚠️ Context weak")
+
+            strength = "strong" if is_valid else "medium"
+
+            patterns.append({
+                "pattern": f"{'Bullish' if harami_dir == 'bullish' else 'Bearish'} Harami",
+                "type": "reversal",
+                "date": date.strftime("%Y-%m-%d"),
+                "signal": harami_dir,
+                "strength": strength,
+                "trend_context": trend,
+                "price_vs_ma": price_pos,
+                "is_valid": is_valid,
+                "volume_confirmed": has_volume,
+                "description": description
+            })
+
+        # DARK CLOUD COVER - Bearish reversal
+        if is_dark_cloud_cover(prev['Open'], prev['Close'], curr['Open'], curr['Close'], curr['High']):
+            is_valid = bool(trend == "uptrend" or price_pos in ["above", "at"])
+            strength = "very_strong" if is_valid and has_high_volume else "strong" if is_valid else "medium"
+
+            patterns.append({
+                "pattern": "Dark Cloud Cover",
+                "type": "reversal",
+                "date": date.strftime("%Y-%m-%d"),
+                "signal": "bearish",
+                "strength": strength,
+                "trend_context": trend,
+                "price_vs_ma": price_pos,
+                "is_valid": is_valid,
+                "volume_confirmed": has_volume,
+                "description": "Bearish reversal - bearish penetration of prior bullish candle" +
+                              (" ✓" if is_valid else " ⚠️ Context weak")
             })
 
     return patterns
